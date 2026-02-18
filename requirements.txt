@@ -4,3 +4,14 @@ requests>=2.28.0
 flask>=2.0.0
 flask-cors>=4.0.0
 waitress>=2.0.0
+
+# For real-time teleop trajectory processing
+scipy>=1.10.0
+imageio>=2.25.0
+imageio-ffmpeg>=0.4.8
+
+# Pyroki for IK and trajectory optimization (install from source)
+# pip install pyroki robot_descriptions yourdfpy
+# Or: git clone https://github.com/chungmin99/pyroki.git && pip install -e .
+
+jax[cuda13]>=0.9.0.1
