@@ -6,8 +6,9 @@ from pathlib import Path
 import imageio
 import numpy as np
 from scipy.interpolate import CubicSpline
-
-os.environ.setdefault("MUJOCO_GL", "egl")
+from sys import platform
+# os.environ.setdefault("MUJOCO_GL", "egl")
+os.environ["MUJOCO_GL"] = "glfw" if platform == "darwin" else "egl"
 
 import mujoco
 import pyroki as pk
