@@ -154,8 +154,6 @@ class PandaArmTrajectoryProcessor:
         self._trajectory[side].append((t, q_out))
         for cb in self.callbacks:
             cb(side, q_out, t)
-        if len(self._trajectory[side]) > 2000:
-            self._trajectory[side] = self._trajectory[side][-2000:]
 
     # -- public API --------------------------------------------------------
 
@@ -247,8 +245,6 @@ class PandaArmTrajectoryProcessor:
                 wrist_poses[-1, 3:7].copy()
                 if wrist_poses.shape[1] == 7 else None
             )
-            if len(traj) > 2000:
-                self._trajectory[side] = traj[-2000:]
             self._logical_time[side] = prev_t
 
     def get_trajectory(self, side):
