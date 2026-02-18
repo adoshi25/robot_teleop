@@ -62,6 +62,10 @@ proc = PandaArmTrajectoryProcessor(control_hz=control_hz)
 
 proc.start_trajectory()
 
+def print_joints_callback(side, joints, timestep):
+    print(joints)
+
+proc.register_callback(print_joints_callback)
 # ---------------------------------------------------------------------------
 # Stream points one-by-one at control_hz (simulating real-time teleop)
 # ---------------------------------------------------------------------------
