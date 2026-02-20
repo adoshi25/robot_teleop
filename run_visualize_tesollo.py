@@ -6,9 +6,9 @@ import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent
-TESOLLO_DIR = REPO_ROOT / "tesollo_hand 2"
+TESOLLO_DIR = REPO_ROOT / "teleop" / "robots" / "tesollo_hand"
 MJCF = TESOLLO_DIR / "robot_scene_combined.xml"
-VISUALIZER = REPO_ROOT / "chimera" / "tools" / "visualize_hand_tracking.py"
+VISUALIZER = REPO_ROOT / "teleop" / "visualize_hand_tracking.py"
 
 if not MJCF.exists():
     print(f"Error: {MJCF} not found.", file=sys.stderr)
@@ -28,7 +28,7 @@ def get_mjpython():
 
 mjpython = get_mjpython()
 if mjpython:
-    os.execv(mjpython, [mjpython, str(VISUALIZER)])
+    os.execv(mjpython, [mjpython, str(VISUALIZER), "--mjcf-path", str(MJCF.resolve())])
 else:
     if sys.platform == "darwin":
         print("On macOS the viewer needs mjpython. Install and run:", file=sys.stderr)

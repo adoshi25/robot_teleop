@@ -17,7 +17,7 @@ source venv/bin/activate
 
 2. Terminal 1 – start the server:
 ```bash
-python chimera/tools/start_hand_tracker.py
+python teleop/start_hand_tracker.py
 ```
 
 3. With Quest connected over USB – forward the port:
@@ -29,7 +29,7 @@ adb reverse tcp:9002 tcp:9002
 
 5. Terminal 2 – start the visualizer (activate venv in this terminal too):
 ```bash
-python chimera/tools/visualize_hand_tracking.py
+python teleop/visualize_hand_tracking.py
 ```
 Or for tesollo scene:
 ```bash
