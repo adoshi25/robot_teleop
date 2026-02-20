@@ -78,7 +78,7 @@ class PandaArmTrajectoryProcessor:
         if scene_path is None:
             scene_path = (
                 Path(__file__).resolve().parent
-                / "tesollo_hand 2"
+                / "teleop" / "robots" / "tesollo_hand"
                 / "robot_scene_combined.xml"
             )
         self.scene_path = Path(scene_path)
