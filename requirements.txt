@@ -14,4 +14,4 @@ imageio-ffmpeg>=0.4.8
 # pip install pyroki robot_descriptions yourdfpy
 # Or: git clone https://github.com/chungmin99/pyroki.git && pip install -e .
 
-jax[cuda13]>=0.9.0.1
+# jax[cuda13]>=0.9.0.1
