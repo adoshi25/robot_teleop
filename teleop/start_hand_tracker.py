@@ -465,4 +465,5 @@ if __name__ == '__main__':
     print("Requires: VR headset with hand tracking (Meta Quest, etc.)")
     print("=" * 50)
     print("Listening on http://0.0.0.0:9002 (Ctrl+C to stop)", flush=True)
+    app.run(host='0.0.0.0', port=9002)
     serve(app, host='0.0.0.0', port=9002, connection_limit=5000, threads=16)

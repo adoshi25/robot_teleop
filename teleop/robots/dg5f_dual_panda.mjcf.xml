@@ -105,7 +105,7 @@
 
   <worldbody>
     <!-- LEFT ARM -->
-    <body name="panda_left_link0" pos="-0.45 -0.5 0.6" quat="0.154 0 0 -0.988" childclass="robot">
+    <body name="panda_left_link0" pos="0.45 -0.5 0.6" quat="0.154 0 0 -0.988" childclass="robot">
       <geom name="panda_left_link0_collision" pos="0 0 0" quat="1 0 0 0" type="mesh" mesh="link0.stl" class="left-collision" />
       <body name="panda_left_link1" pos="0 0 0.333" quat="1.0 0.0 0.0 0.0">
         <joint name="panda_left_joint1" type="hinge" ref="0.0" class="motor" range="-2.8973 2.8973" axis="0 0 1" />
@@ -296,7 +296,7 @@
       </body>
     </body> 
     <!-- RIGHT ARM -->
-    <body name="panda_right_link0" pos="0.45 -0.5 0.6" quat="0.988 0.0 0.0 -0.154" childclass="robot">
+    <body name="panda_right_link0" pos="-0.45 -0.5 0.6" quat="0.988 0.0 0.0 -0.154" childclass="robot">
       <geom name="panda_right_link0_collision" pos="0 0 0" quat="1 0 0 0" type="mesh" mesh="link0.stl" class="collision" />
       <body name="panda_right_link1" pos="0 0 0.333" quat="1.0 0.0 0.0 0.0">
         <joint name="panda_right_joint1" type="hinge" ref="0.0" class="motor" range="-2.8973 2.8973" axis="0 0 1" />

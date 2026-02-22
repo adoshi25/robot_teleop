@@ -1,6 +1,15 @@
 import numpy as np
 import mujoco
 
+RETARGET_GENESIS_TO_VISER_ORDER = np.array([
+    0, 1, 2, 3, 4, 5, 6,
+    7, 12, 17, 22,
+    8, 13, 18, 23,
+    9, 14, 19, 24,
+    10, 15, 20, 25,
+    11, 16, 21, 26,
+])
+
 CANONICAL_QPOS = np.array([
     0.12851247, -0.74926734,  0.01523919, -2.5314567,   1.3384545,
     1.8232623,   0.72626555, -0.4,         0.14,         0.08,
@@ -13,7 +22,7 @@ CANONICAL_QPOS = np.array([
     0.23,        0.08,        0.28,          0.,           0.6,
     0.25,        0.69,       -0.02,          0.71,        -0.02,
    -0.22,       -0.82,       -0.17,         -1.33
-])
+])[RETARGET_GENESIS_TO_VISER_ORDER]
 
 SPACE_KEY = 32
 
