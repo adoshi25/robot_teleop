@@ -198,13 +198,25 @@ def fetch_hands():
     return None
 
 
+def _xmat_to_wxyz(xmat):
+    """Convert a 3x3 rotation matrix (flattened 9-vec from MuJoCo) to wxyz quaternion."""
+    mat = np.array(xmat, dtype=float).reshape(3, 3)
+    from scipy.spatial.transform import Rotation
+    r = Rotation.from_matrix(mat)
+    xyzw = r.as_quat()
+    return np.array([xyzw[3], xyzw[0], xyzw[1], xyzw[2]])
+
+
 def read_canonical_positions(model, data):
-    """FK positions of every tracked site at the current qpos."""
+    """FK positions and wrist orientations of every tracked site at the current qpos."""
     out = {}
     for side, joints in ROBOT_SITES.items():
         out[side] = {}
         for jname, sname in joints.items():
-            out[side][jname] = data.site_xpos[model.site(sname).id].copy()
+            sid = model.site(sname).id
+            out[side][jname] = data.site_xpos[sid].copy()
+            if jname == "wrist":
+                out[side]["_wrist_quat"] = _xmat_to_wxyz(data.site_xmat[sid])
     return out
 
 
@@ -226,6 +238,9 @@ def compute_offsets(hand_data, canonical):
             offsets[side]["_wrist_quat_cal"] = webxr_quat_to_mujoco_wxyz(
                 wrist["orientation"]
             )
+        canon_wrist_q = canonical.get(side, {}).get("_wrist_quat")
+        if canon_wrist_q is not None:
+            offsets[side]["_wrist_quat_robot"] = canon_wrist_q.copy()
     return offsets
 
 
@@ -241,33 +256,33 @@ def get_offset_wrist(hand_data, side, offsets):
     return webxr_to_mujoco(w["position"]) + off
 
 
-def compute_wrist_roll(hand_joints, side, offsets):
-    """Extract wrist roll angle (twist around forearm axis) relative to calibration.
+def get_offset_wrist_pose(hand_data, side, offsets):
+    """Offset-corrected wrist pose [x, y, z, w, qx, qy, qz] in world frame, or None.
 
-    Uses the direction from wrist to middle-finger-metacarpal as the
-    forearm/twist axis, then decomposes the relative orientation
-    quaternion to pull out only the rotation around that axis.
+    Position: same as get_offset_wrist.
+    Orientation: q_delta * q_cal_robot, where q_delta = q_cur * q_cal^{-1}.
+    When the user's hand hasn't rotated, the target orientation equals the
+    canonical robot wrist orientation, ensuring zero IK error at rest.
     """
-    wrist = hand_joints.get("wrist")
-    q_cal = offsets.get(side, {}).get("_wrist_quat_cal")
-    if wrist is None or "orientation" not in wrist or q_cal is None:
+    pos = get_offset_wrist(hand_data, side, offsets)
+    if pos is None:
         return None
 
+    side_off = offsets.get(side, {})
+    q_cal = side_off.get("_wrist_quat_cal")
+    q_robot = side_off.get("_wrist_quat_robot")
+
+    joints = hand_data.get(side, {})
+    wrist = joints.get("wrist", {})
+
+    if q_cal is None or q_robot is None or "orientation" not in wrist:
+        return pos
+
     q_cur = webxr_quat_to_mujoco_wxyz(wrist["orientation"])
-    q_rel = _qmul(q_cur, _qinv(q_cal))
+    q_delta = _qmul(q_cur, _qinv(q_cal))
+    q_target = _qmul(q_delta, q_robot)
 
-    mid_meta = hand_joints.get("middle-finger-metacarpal")
-    if mid_meta and "position" in mid_meta:
-        wrist_pos = webxr_to_mujoco(wrist["position"])
-        meta_pos = webxr_to_mujoco(mid_meta["position"])
-        fwd = meta_pos - wrist_pos
-        norm = np.linalg.norm(fwd)
-        twist_axis = fwd / norm if norm > 1e-6 else np.array([0.0, 1.0, 0.0])
-    else:
-        twist_axis = np.array([0.0, 1.0, 0.0])
-
-    p = float(np.dot(q_rel[1:4], twist_axis))
-    return 2.0 * np.arctan2(p, float(q_rel[0]))
+    return np.concatenate([pos, q_target])
 
 
 def build_finger_index_map(model):
@@ -598,29 +613,16 @@ def main():
             interpolation_points=0,
             smoothing_alpha=1.0,
             smoothing_sigma=0.0,
-            pos_only=True,
+            ori_weight=5.0,
         )
     else:
         proc = PandaArmTrajectoryProcessor(
-            scene_path=mjcf_path, control_hz=CONTROL_HZ, pos_only=True,
+            scene_path=mjcf_path, control_hz=CONTROL_HZ, ori_weight=5.0,
         )
     arm_idx = {s: proc.get_mujoco_qpos_indices(s) for s in ("left", "right")}
     canonical_q = {s: data.qpos[arm_idx[s]].copy() for s in ("left", "right")}
     ik_q = {"left": None, "right": None}
     prev_ik_q = {"left": None, "right": None}
-
-    # Joint 7 (wrist roll) — driven directly from WebXR orientation, not IK
-    j7_qidx = {}
-    j7_range = {}
-    for side in ("left", "right"):
-        idx = arm_idx[side][6]
-        j7_qidx[side] = idx
-        for jid in range(model.njnt):
-            if int(model.jnt_qposadr[jid]) == idx:
-                j7_range[side] = (float(model.jnt_range[jid, 0]),
-                                  float(model.jnt_range[jid, 1]))
-                break
-    wrist_roll = {"left": 0.0, "right": 0.0}
 
     # Finger retargeting
     finger_map = build_finger_index_map(model)
@@ -690,7 +692,6 @@ def main():
             abd_rest[0] = {}
             reanchor["left"] = reanchor["right"] = False
             latest_webxr_wrist["left"] = latest_webxr_wrist["right"] = None
-            wrist_roll["left"] = wrist_roll["right"] = 0.0
             log_samples.clear()
             print(f"Warmup {WARMUP_SECONDS}s — hold hands steady...")
         else:
@@ -702,7 +703,6 @@ def main():
             abd_rest[0] = {}
             reanchor["left"] = reanchor["right"] = False
             latest_webxr_wrist["left"] = latest_webxr_wrist["right"] = None
-            wrist_roll["left"] = wrist_roll["right"] = 0.0
             print("Stopped.")
             if log_samples:
                 np.savez_compressed(
@@ -796,26 +796,19 @@ def main():
                             prev_ik_q[side] = data.qpos[arm_idx[side]].copy()
                             reanchor[side] = False
 
-                        wrist = get_offset_wrist(hand_data, side, offsets[0])
-                        if wrist is not None:
-                            proc.add_point(wrist, side)
+                        wrist_pose = get_offset_wrist_pose(hand_data, side, offsets[0])
+                        if wrist_pose is not None:
+                            proc.add_point(wrist_pose, side)
                         if joints:
                             finger_qpos[side] = retarget_fingers(
                                 joints, side, finger_map, abd_rest[0]
                             )
-                            roll = compute_wrist_roll(joints, side, offsets[0])
-                            if roll is not None:
-                                wrist_roll[side] = roll
                 last_fetch[0] = now
 
             for side in ("left", "right"):
                 q = ik_q[side]
                 if q is not None:
                     data.qpos[arm_idx[side]] = q
-                lo, hi = j7_range[side]
-                data.qpos[j7_qidx[side]] = np.clip(
-                    data.qpos[j7_qidx[side]] + wrist_roll[side], lo, hi
-                )
                 for qidx, angle in finger_qpos[side].items():
                     data.qpos[qidx] = angle
 
@@ -869,7 +862,6 @@ def main():
                     "webxr_raw": latest_raw_hand_data[0],
                     "robot_sites": robot_sites,
                     "robot_qpos": data.qpos.copy(),
-                    "wrist_roll": dict(wrist_roll),
                     "offsets": offsets_copy,
                     "ik_diag": ik_diag_copy,
                     "ik_target_world": ik_target_world,

@@ -100,13 +100,13 @@ def _solve_ik_core_jax_warm(
     return sol[joint_var]
 
 
-def _solve_ik_core_pos_only(
+def _solve_ik_core_balanced(
     robot,
     target_link_index: jnp.ndarray,
     target_position: jnp.ndarray,
     target_wxyz: jnp.ndarray,
 ) -> jnp.ndarray:
-    """JIT-compiled position-only IK (no warm start)."""
+    """JIT-compiled IK with balanced weights (no warm start)."""
     joint_var = robot.joint_var_cls(0)
     target_pose = jaxlie.SE3.from_rotation_and_translation(
         jaxlie.SO3(target_wxyz), target_position
@@ -114,7 +114,7 @@ def _solve_ik_core_pos_only(
     costs = [
         pk.costs.pose_cost_analytic_jac(
             robot, joint_var, target_pose, target_link_index,
-            pos_weight=50.0, ori_weight=0.0,
+            pos_weight=50.0, ori_weight=5.0,
         ),
         pk.costs.limit_constraint(robot, joint_var),
     ]
@@ -130,14 +130,14 @@ def _solve_ik_core_pos_only(
     return sol[joint_var]
 
 
-def _solve_ik_core_pos_only_warm(
+def _solve_ik_core_balanced_warm(
     robot,
     target_link_index: jnp.ndarray,
     target_position: jnp.ndarray,
     target_wxyz: jnp.ndarray,
     initial_q: jnp.ndarray,
 ) -> jnp.ndarray:
-    """JIT-compiled position-only IK with warm start."""
+    """JIT-compiled IK with balanced weights and warm start."""
     joint_var = robot.joint_var_cls(0)
     target_pose = jaxlie.SE3.from_rotation_and_translation(
         jaxlie.SO3(target_wxyz), target_position
@@ -145,7 +145,7 @@ def _solve_ik_core_pos_only_warm(
     costs = [
         pk.costs.pose_cost_analytic_jac(
             robot, joint_var, target_pose, target_link_index,
-            pos_weight=50.0, ori_weight=0.0,
+            pos_weight=50.0, ori_weight=5.0,
         ),
         pk.costs.limit_constraint(robot, joint_var),
     ]
@@ -164,12 +164,19 @@ def _solve_ik_core_pos_only_warm(
 
 _solve_ik_jit = jax.jit(_solve_ik_core_jax)
 _solve_ik_warm_jit = jax.jit(_solve_ik_core_jax_warm)
-_solve_ik_pos_jit = jax.jit(_solve_ik_core_pos_only)
-_solve_ik_pos_warm_jit = jax.jit(_solve_ik_core_pos_only_warm)
+_solve_ik_balanced_jit = jax.jit(_solve_ik_core_balanced)
+_solve_ik_balanced_warm_jit = jax.jit(_solve_ik_core_balanced_warm)
 _solve_ik_batch_jit = jax.jit(jax.vmap(_solve_ik_core_jax, in_axes=(None, None, 0, None)))
 _solve_ik_batch_poses_jit = jax.jit(
     jax.vmap(_solve_ik_core_jax, in_axes=(None, None, 0, 0))
 )
+
+
+# ori_weight value -> (cold_jit, warm_jit) lookup; pre-built for common values
+_ORI_WEIGHT_DISPATCH = {
+    10.0: (_solve_ik_jit, _solve_ik_warm_jit),
+    5.0: (_solve_ik_balanced_jit, _solve_ik_balanced_warm_jit),
+}
 
 
 def _solve_ik_pyroki(
@@ -178,30 +185,29 @@ def _solve_ik_pyroki(
     target_position,
     target_wxyz,
     initial_q=None,
-    pos_only=False,
+    ori_weight=5.0,
 ):
     """
     Solve IK using pyroki. Returns 7-DOF joint config (arm only).
     initial_q: Optional (7,) for warm start (faster convergence when streaming).
-    pos_only: If True, ignore orientation cost for better position accuracy.
+    ori_weight: Orientation cost weight (0=position-only, 5=balanced, 10=original).
     """
     target_link_index = jnp.array(
         robot.links.names.index(target_link_name), dtype=jnp.int32
     )
     pos = jnp.asarray(target_position, dtype=jnp.float32)
     wxyz = jnp.asarray(target_wxyz, dtype=jnp.float32)
+
+    cold_fn, warm_fn = _ORI_WEIGHT_DISPATCH.get(
+        ori_weight, (_solve_ik_balanced_jit, _solve_ik_balanced_warm_jit)
+    )
+
     if initial_q is not None:
         q0 = jnp.asarray(initial_q, dtype=jnp.float32)
         init = jnp.concatenate([q0.reshape(-1)[:7], jnp.array([0.0])])[:8]
-        if pos_only:
-            q = _solve_ik_pos_warm_jit(robot, target_link_index, pos, wxyz, init)
-        else:
-            q = _solve_ik_warm_jit(robot, target_link_index, pos, wxyz, init)
+        q = warm_fn(robot, target_link_index, pos, wxyz, init)
     else:
-        if pos_only:
-            q = _solve_ik_pos_jit(robot, target_link_index, pos, wxyz)
-        else:
-            q = _solve_ik_jit(robot, target_link_index, pos, wxyz)
+        q = cold_fn(robot, target_link_index, pos, wxyz)
     return np.array(q[:7])
 
 

@@ -41,8 +41,7 @@ class PandaArmTrajectoryProcessor:
         interpolation_points=3,
         smoothing_alpha=0.4,
         smoothing_sigma=2.0,
-        ee_orientation=None,
-        pos_only=False,
+        ori_weight=5.0,
     ):
         self.callbacks = []
         self.control_hz = float(control_hz)
@@ -52,11 +51,8 @@ class PandaArmTrajectoryProcessor:
         self.interpolation_points = interpolation_points
         self.smoothing_alpha = smoothing_alpha
         self.smoothing_sigma = smoothing_sigma
-        self.pos_only = pos_only
-        self.ee_orientation = (
-            ee_orientation if ee_orientation is not None
-            else np.array([0.0, 0.0, 1.0, 0.0])
-        )
+        self.ori_weight = ori_weight
+        self._default_ori = np.array([1.0, 0.0, 0.0, 0.0])
 
         self._last_point = {"left": None, "right": None}
         self._last_quat = {"left": None, "right": None}
@@ -130,10 +126,23 @@ class PandaArmTrajectoryProcessor:
         dummy_q = self._default_start_joints["right"]
         self._run_ik(
             dummy_pos, "right",
-            initial_q=dummy_q, target_wxyz=self.ee_orientation,
+            initial_q=dummy_q, target_wxyz=self._default_ori,
         )
 
-    def _world_to_base(self, world_pos, side):
+    @staticmethod
+    def _qmul(q1, q2):
+        """Hamilton product of two wxyz quaternions."""
+        w1, x1, y1, z1 = q1
+        w2, x2, y2, z2 = q2
+        return np.array([
+            w1*w2 - x1*x2 - y1*y2 - z1*z2,
+            w1*x2 + x1*w2 + y1*z2 - z1*y2,
+            w1*y2 - x1*z2 + y1*w2 + z1*x2,
+            w1*z2 + x1*y2 - y1*x2 + z1*w2,
+        ])
+
+    def _world_to_base_pos(self, world_pos, side):
+        """Transform a world-frame position into the arm's base frame."""
         pose = self._base_poses[side]
         pos = np.array(world_pos, dtype=float) - pose["pos"]
         quat = pose["quat"]
@@ -147,13 +156,21 @@ class PandaArmTrajectoryProcessor:
         ])
         return rot.T @ pos
 
+    def _world_to_base_quat(self, world_wxyz, side):
+        """Transform a world-frame orientation (wxyz) into the arm's base frame."""
+        base_quat = self._base_poses[side]["quat"]
+        if base_quat is None:
+            return np.array(world_wxyz, dtype=float)
+        q_inv = np.array([base_quat[0], -base_quat[1], -base_quat[2], -base_quat[3]])
+        return self._qmul(q_inv, np.asarray(world_wxyz, dtype=float))
+
     def _run_ik(self, target_pos, side, initial_q=None, target_wxyz=None):
-        wxyz = target_wxyz if target_wxyz is not None else self.ee_orientation
+        wxyz = target_wxyz if target_wxyz is not None else self._default_ori
         return np.array(
             _solve_ik_pyroki(
                 self._robot, self._target_link, target_pos, wxyz,
                 initial_q=initial_q,
-                pos_only=self.pos_only,
+                ori_weight=self.ori_weight,
             )
         )
 
@@ -194,9 +211,12 @@ class PandaArmTrajectoryProcessor:
     def add_point(self, wrist_pose, side):
         """Add a wrist pose. Always records exactly one waypoint at the next control tick."""
         pos, wxyz = self._parse_pose(wrist_pose)
-        base_pos = self._world_to_base(pos, side)
+        base_pos = self._world_to_base_pos(pos, side)
         self.last_ik_target_base[side] = base_pos.copy()
-        ori = wxyz if wxyz is not None else self.ee_orientation
+        if wxyz is not None:
+            ori = self._world_to_base_quat(wxyz, side)
+        else:
+            ori = self._default_ori
 
         with self._lock:
             last = self._last_point[side]
@@ -251,18 +271,21 @@ class PandaArmTrajectoryProcessor:
         if wrist_poses.ndim == 1:
             wrist_poses = wrist_poses.reshape(1, -1)
         base_positions = np.array([
-            self._world_to_base(p, side) for p in wrist_poses[:, :3]
+            self._world_to_base_pos(p, side) for p in wrist_poses[:, :3]
         ])
         if wrist_poses.shape[1] == 7:
+            base_quats = np.array([
+                self._world_to_base_quat(q, side) for q in wrist_poses[:, 3:7]
+            ])
             qs = _solve_ik_pyroki_batch(
                 self._robot, self._target_link, base_positions,
-                self.ee_orientation,
-                target_wxyz_per_point=wrist_poses[:, 3:7],
+                self._default_ori,
+                target_wxyz_per_point=base_quats,
             )
         else:
             qs = _solve_ik_pyroki_batch(
                 self._robot, self._target_link, base_positions,
-                self.ee_orientation,
+                self._default_ori,
             )
         with self._lock:
             traj = self._trajectory[side]
