@@ -15,7 +15,7 @@ import pyroki as pk
 from robot_descriptions.loaders.yourdfpy import load_robot_description
 
 from teleop_utils import (
-    _get_robot_base_positions_from_model,
+    _get_robot_base_poses_from_model,
     _slerp_wxyz,
     _smooth_trajectory,
     _solve_ik_pyroki,
@@ -42,6 +42,7 @@ class PandaArmTrajectoryProcessor:
         smoothing_alpha=0.4,
         smoothing_sigma=2.0,
         ee_orientation=None,
+        pos_only=False,
     ):
         self.callbacks = []
         self.control_hz = float(control_hz)
@@ -51,6 +52,7 @@ class PandaArmTrajectoryProcessor:
         self.interpolation_points = interpolation_points
         self.smoothing_alpha = smoothing_alpha
         self.smoothing_sigma = smoothing_sigma
+        self.pos_only = pos_only
         self.ee_orientation = (
             ee_orientation if ee_orientation is not None
             else np.array([0.0, 0.0, 1.0, 0.0])
@@ -63,17 +65,8 @@ class PandaArmTrajectoryProcessor:
         self._logical_time = {"left": None, "right": None}
         self._trajectory = {"left": [], "right": []}
         self._lock = threading.Lock()
-
-        self._default_start_joints = {
-            "left": np.array([
-                0.12851247, -0.74926734, 0.01523919, -2.5314567,
-                1.3384545, 1.8232623, 0.72626555,
-            ]),
-            "right": np.array([
-                -0.30540678, -0.79184073, 0.06812683, -2.5840569,
-                -1.3527942, 2.0385659, 0.62929636,
-            ]),
-        }
+        self.last_ik_raw = {"left": None, "right": None}
+        self.last_ik_target_base = {"left": None, "right": None}
 
         if scene_path is None:
             scene_path = (
@@ -85,9 +78,11 @@ class PandaArmTrajectoryProcessor:
 
         self._mj_model = mujoco.MjModel.from_xml_path(str(self.scene_path))
         self._mj_data = mujoco.MjData(self._mj_model)
-        self._base_positions = _get_robot_base_positions_from_model(self._mj_model)
+        self._base_poses = _get_robot_base_poses_from_model(self._mj_model)
         self._left_joint_indices = self._get_panda_joint_indices("left")
         self._right_joint_indices = self._get_panda_joint_indices("right")
+
+        self._default_start_joints = self._read_keyframe_joints()
 
         urdf = load_robot_description("panda_description")
         self._robot = pk.Robot.from_urdf(urdf)
@@ -120,6 +115,15 @@ class PandaArmTrajectoryProcessor:
                 indices.append(int(qposadr) + i)
         return indices
 
+    def _read_keyframe_joints(self):
+        """Read canonical joint angles from keyframe 0."""
+        mujoco.mj_resetDataKeyframe(self._mj_model, self._mj_data, 0)
+        mujoco.mj_forward(self._mj_model, self._mj_data)
+        return {
+            "left": self._mj_data.qpos[self._left_joint_indices].copy(),
+            "right": self._mj_data.qpos[self._right_joint_indices].copy(),
+        }
+
     def _warmup_ik(self):
         """Run a dummy IK solve to trigger JAX JIT compilation at init time."""
         dummy_pos = np.array([0.3, 0.0, 0.3])
@@ -130,7 +134,18 @@ class PandaArmTrajectoryProcessor:
         )
 
     def _world_to_base(self, world_pos, side):
-        return np.array(world_pos, dtype=float) - self._base_positions[side]
+        pose = self._base_poses[side]
+        pos = np.array(world_pos, dtype=float) - pose["pos"]
+        quat = pose["quat"]
+        if quat is None:
+            return pos
+        w, x, y, z = quat
+        rot = np.array([
+            [1 - 2*(y*y + z*z), 2*(x*y - z*w), 2*(x*z + y*w)],
+            [2*(x*y + z*w), 1 - 2*(x*x + z*z), 2*(y*z - x*w)],
+            [2*(x*z - y*w), 2*(y*z + x*w), 1 - 2*(x*x + y*y)],
+        ])
+        return rot.T @ pos
 
     def _run_ik(self, target_pos, side, initial_q=None, target_wxyz=None):
         wxyz = target_wxyz if target_wxyz is not None else self.ee_orientation
@@ -138,6 +153,7 @@ class PandaArmTrajectoryProcessor:
             _solve_ik_pyroki(
                 self._robot, self._target_link, target_pos, wxyz,
                 initial_q=initial_q,
+                pos_only=self.pos_only,
             )
         )
 
@@ -151,6 +167,7 @@ class PandaArmTrajectoryProcessor:
 
     def _update_ema(self, side, q_raw):
         """Feed a joint config into the EMA filter (no recording)."""
+        self.last_ik_raw[side] = q_raw.copy()
         if self._smoothed_joint[side] is None:
             self._smoothed_joint[side] = q_raw.copy()
         else:
@@ -178,6 +195,7 @@ class PandaArmTrajectoryProcessor:
         """Add a wrist pose. Always records exactly one waypoint at the next control tick."""
         pos, wxyz = self._parse_pose(wrist_pose)
         base_pos = self._world_to_base(pos, side)
+        self.last_ik_target_base[side] = base_pos.copy()
         ori = wxyz if wxyz is not None else self.ee_orientation
 
         with self._lock:
@@ -232,7 +250,9 @@ class PandaArmTrajectoryProcessor:
         wrist_poses = np.asarray(wrist_poses, dtype=float)
         if wrist_poses.ndim == 1:
             wrist_poses = wrist_poses.reshape(1, -1)
-        base_positions = wrist_poses[:, :3] - self._base_positions[side]
+        base_positions = np.array([
+            self._world_to_base(p, side) for p in wrist_poses[:, :3]
+        ])
         if wrist_poses.shape[1] == 7:
             qs = _solve_ik_pyroki_batch(
                 self._robot, self._target_link, base_positions,

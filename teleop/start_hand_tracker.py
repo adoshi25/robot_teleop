@@ -9,7 +9,7 @@ import time
 from datetime import datetime
 import faulthandler
 
-os.environ['USE_NGROK'] = '1'
+os.environ['USE_NGROK'] = '0'
 os.environ['HAND_TRACKER_DEBUG'] = '1'
 app = Flask(__name__)
 CORS(app)
