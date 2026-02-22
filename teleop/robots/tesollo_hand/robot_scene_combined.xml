@@ -1,6 +1,9 @@
 <?xml version='1.0' encoding='utf-8'?>
 <mujoco model="robot_scene">
   <compiler angle="radian" coordinate="local" meshdir="." strippath="false" />
+  <option>
+    <flag filterparent="disable" />
+  </option>
   <asset>
     <texture name="grid" type="2d" builtin="checker" rgb1="0.1 0.2 0.3" rgb2="0.2 0.3 0.4" width="300" height="300" />
     <material name="grid" texture="grid" texrepeat="1 1" />
@@ -82,18 +85,18 @@
     <light pos="0 0 3" dir="0 0 -1" directional="true" />
     <body name="table" pos="0.7 0 0">
       <inertial pos="0 0 0.1" mass="10" diaginertia="1 1 1" />
-      <geom name="table_top" type="box" pos="0 0 0.2" size="0.4 0.4 0.05" material="table" contype="1" conaffinity="1" />
-      <geom type="cylinder" pos="-0.35 -0.35 0.075" size="0.02 0.075" material="table" contype="1" conaffinity="1" />
-      <geom type="cylinder" pos="0.35 -0.35 0.075" size="0.02 0.075" material="table" contype="1" conaffinity="1" />
-      <geom type="cylinder" pos="-0.35 0.35 0.075" size="0.02 0.075" material="table" contype="1" conaffinity="1" />
-      <geom type="cylinder" pos="0.35 0.35 0.075" size="0.02 0.075" material="table" contype="1" conaffinity="1" />
+      <geom name="table_top" type="box" pos="0 0 0.2" size="0.25 0.25 0.05" material="table" contype="1" conaffinity="1" />
+      <geom type="cylinder" pos="-0.2 -0.2 0.075" size="0.02 0.075" material="table" contype="1" conaffinity="1" />
+      <geom type="cylinder" pos="0.2 -0.2 0.075" size="0.02 0.075" material="table" contype="1" conaffinity="1" />
+      <geom type="cylinder" pos="-0.2 0.2 0.075" size="0.02 0.075" material="table" contype="1" conaffinity="1" />
+      <geom type="cylinder" pos="0.2 0.2 0.075" size="0.02 0.075" material="table" contype="1" conaffinity="1" />
     </body>
     <body name="box" pos="0.7 0 0.25">
       <inertial pos="0 0 0" mass="0.1" diaginertia="0.001 0.001 0.001" />
       <geom name="box" type="box" size="0.05 0.05 0.05" material="box" contype="1" conaffinity="1" />
       <joint name="box_joint" type="free" damping="0.01" />
     </body>
-    <body name="left_robot_base" pos="0.7 -0.4 0">
+    <body name="left_robot_base" pos="0.7 -0.6 0">
       <body name="panda_left_link0">
         <inertial pos="-0.041018 -0.00014 0.049974" mass="0.629769" fullinertia="0.00315 0.00388 0.004285 8.2904e-07 0.00015 8.2299e-06" />
         <geom type="mesh" mesh="mesh_panda_left_link0" contype="1" conaffinity="1" />
@@ -272,7 +275,7 @@
         </body>
       </body>
     </body>
-    <body name="right_robot_base" pos="0.7 0.4 0">
+    <body name="right_robot_base" pos="0.7 0.6 0">
       <body name="panda_link0">
         <inertial pos="-0.041018 -0.00014 0.049974" mass="0.629769" fullinertia="0.00315 0.00388 0.004285 8.2904e-07 0.00015 8.2299e-06" />
         <geom type="mesh" mesh="mesh_panda_link0" contype="1" conaffinity="1" />
@@ -507,6 +510,6 @@
   </equality>
   <!-- Initial pose: qpos order = box(7) then left_arm(7) left_hand(20) right_arm(7) right_hand(20). Edit values 8-61 to change robot pose. -->
   <keyframe>
-    <key name="home" qpos="0.7 0 0.25 1 0 0 0  0.12851247 -0.74926734 0.01523919 -2.5314567 1.3384545 1.8232623 0.72626555  -0.4 0.14 0.08 0.1 -0.43 0.07 0.44 0.52 0.77 0.03 -0.81 0.31 0.51 -0.33 -0.12 0.23 -0.29 -1.03 -0.56 1.21  -0.30540678 -0.79184073 0.06812683 -2.5840569 -1.3527942 2.0385659 0.62929636  0.3 -0.08 -0.07 -0.04 0 -0.04 0.23 0.08 0.28 0 0.6 0.25 0.69 -0.02 0.71 -0.02 -0.22 -0.82 -0.17 -1.33" />
+    <key name="home" qpos="0.7 0 0.25 1 0 0 0  0.12851247 -0.74926734 0.01523919 -2.5314567 1.3384545 1.8232623 0.72626555 -0.4 0.07 -0.81 0.23 0.14 0.44 0.31 -0.29 0.08 0.52 0.51 -1.03 0.1 0.77 -0.33 -0.56 -0.43 0.03 -0.12 1.21 -0.30540678 -0.79184073 0.06812683 -2.5840569 -1.3527942 2.0385659 0.62929636 0.3 -0.04 0.6 -0.02 -0.08 0.23 0.25 -0.22 -0.07 0.08 0.69 -0.82 -0.04 0.28 -0.02 -0.17 0. 0. 0.71 -1.33" />
   </keyframe>
 </mujoco>

@@ -1,13 +1,95 @@
 from flask import Flask, render_template_string, request, jsonify
 from flask_cors import CORS
 import json
+import logging
+import os
+import socket
+import threading
+import time
 from datetime import datetime
+import faulthandler
 
+os.environ['USE_NGROK'] = '1'
+os.environ['HAND_TRACKER_DEBUG'] = '1'
 app = Flask(__name__)
 CORS(app)
 
 # Store latest hand data
 latest_hand_data = {}
+last_hand_data_at = None
+
+# Store latest MuJoCo offscreen frame (JPEG bytes)
+_latest_frame = None
+_frame_lock = threading.Lock()
+
+logger = logging.getLogger("hand_tracker")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s [%(threadName)s] %(message)s",
+)
+
+_stats_lock = threading.Lock()
+_stats = {
+    "hand_data_count": 0,
+    "last_hand_data_at": None,
+    "last_request_from": None,
+    "last_user_agent": None,
+    "last_request_path": None,
+    "last_content_length": 0,
+    "inflight": 0,
+    "last_request_duration_ms": 0.0,
+    "max_request_duration_ms": 0.0,
+    "last_error": None,
+}
+_last_log_time = 0.0
+_debug_enabled = os.environ.get("HAND_TRACKER_DEBUG", "1") == "1"
+_debug_tracebacks = os.environ.get("HAND_TRACKER_DEBUG_TRACE", "0") == "1"
+
+
+def _maybe_log_debug(message: str) -> None:
+    if _debug_enabled:
+        logger.info(message)
+
+
+def _start_watchdog() -> None:
+    if not _debug_enabled:
+        return
+
+    def _watchdog_loop() -> None:
+        while True:
+            time.sleep(10)
+            with _stats_lock:
+                count = _stats["hand_data_count"]
+                last_at = _stats["last_hand_data_at"]
+                last_duration = _stats["last_request_duration_ms"]
+                max_duration = _stats["max_request_duration_ms"]
+                last_error = _stats["last_error"]
+            if last_at:
+                age = (datetime.now() - last_at).total_seconds()
+                _maybe_log_debug(
+                    f"watchdog: last_hand_data_age={age:.1f}s "
+                    f"count={count} last_req_ms={last_duration:.1f} "
+                    f"max_req_ms={max_duration:.1f} last_error={last_error}"
+                )
+            else:
+                _maybe_log_debug("watchdog: no hand data received yet")
+
+    thread = threading.Thread(target=_watchdog_loop, name="watchdog", daemon=True)
+    thread.start()
+
+
+@app.before_request
+def _track_inflight() -> None:
+    with _stats_lock:
+        _stats["inflight"] += 1
+        _stats["last_request_path"] = request.path
+
+
+@app.after_request
+def _track_outflight(response):
+    with _stats_lock:
+        _stats["inflight"] = max(0, _stats["inflight"] - 1)
+    return response
 
 HTML_TEMPLATE = '''
 <!DOCTYPE html>
@@ -64,10 +146,21 @@ HTML_TEMPLATE = '''
         let refSpace = null;
         let renderer, scene, camera;
         let handMeshes = { left: {}, right: {} };
+        let mjCanvas, mjCtx, mjTexture, mjPanel;
+        let mjFetchInFlight = false;
+        let lastMjFetch = 0;
+        const mjFetchIntervalMs = 100;
         const status = document.getElementById('status');
         const dataDisplay = document.getElementById('data');
         const startButton = document.getElementById('startButton');
         const container = document.getElementById('container');
+        const sendIntervalMs = 33;
+        let inFlight = false;
+        let lastSendAt = 0;
+        let lastOkAt = 0;
+        let lastErrAt = 0;
+        let errorCount = 0;
+        let droppedCount = 0;
 
         // Joint names for WebXR hand tracking
         const jointNames = [
@@ -139,6 +232,33 @@ HTML_TEMPLATE = '''
             gridHelper.position.y = -0.5;
             scene.add(gridHelper);
             
+            // MuJoCo viewer panel
+            mjCanvas = document.createElement('canvas');
+            mjCanvas.width = 640;
+            mjCanvas.height = 480;
+            mjCtx = mjCanvas.getContext('2d');
+            mjCtx.fillStyle = '#111';
+            mjCtx.fillRect(0, 0, 640, 480);
+            mjCtx.fillStyle = '#666';
+            mjCtx.font = '24px Arial';
+            mjCtx.textAlign = 'center';
+            mjCtx.fillText('Waiting for MuJoCo...', 320, 240);
+
+            mjTexture = new THREE.CanvasTexture(mjCanvas);
+            mjTexture.minFilter = THREE.LinearFilter;
+
+            const borderGeom = new THREE.PlaneGeometry(1.0, 0.77);
+            const borderMat = new THREE.MeshBasicMaterial({ color: 0x222222 });
+            const borderMesh = new THREE.Mesh(borderGeom, borderMat);
+            borderMesh.position.set(0, 1.4, -1.5);
+            scene.add(borderMesh);
+
+            const panelGeom = new THREE.PlaneGeometry(0.96, 0.72);
+            const panelMat = new THREE.MeshBasicMaterial({ map: mjTexture });
+            mjPanel = new THREE.Mesh(panelGeom, panelMat);
+            mjPanel.position.set(0, 1.4, -1.49);
+            scene.add(mjPanel);
+
             // Create hand visualizations
             for (const hand of ['left', 'right']) {
                 const color = hand === 'left' ? 0x00ff88 : 0x00aaff;
@@ -184,14 +304,33 @@ HTML_TEMPLATE = '''
         }
 
         async function sendHandData(handData) {
+            const now = Date.now();
+            if (inFlight || now - lastSendAt < sendIntervalMs) {
+                droppedCount += 1;
+                return;
+            }
+            lastSendAt = now;
+            inFlight = true;
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 2000);
             try {
-                await fetch('/hand_data', {
+                const response = await fetch('/hand_data', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(handData)
+                    body: JSON.stringify(handData),
+                    signal: controller.signal
                 });
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}`);
+                }
+                lastOkAt = Date.now();
             } catch (e) {
+                lastErrAt = Date.now();
+                errorCount += 1;
                 console.error('Error sending hand data:', e);
+            } finally {
+                clearTimeout(timeoutId);
+                inFlight = false;
             }
         }
 
@@ -292,8 +431,38 @@ HTML_TEMPLATE = '''
             }
         }
 
+        function fetchMjFrame() {
+            const now = Date.now();
+            if (mjFetchInFlight || now - lastMjFetch < mjFetchIntervalMs) return;
+            lastMjFetch = now;
+            mjFetchInFlight = true;
+
+            fetch('/mujoco_frame')
+                .then(resp => {
+                    if (!resp.ok || resp.status === 204) throw new Error('no frame');
+                    return resp.blob();
+                })
+                .then(blob => {
+                    const url = URL.createObjectURL(blob);
+                    const img = new Image();
+                    img.onload = () => {
+                        mjCtx.drawImage(img, 0, 0, mjCanvas.width, mjCanvas.height);
+                        mjTexture.needsUpdate = true;
+                        URL.revokeObjectURL(url);
+                        mjFetchInFlight = false;
+                    };
+                    img.onerror = () => {
+                        URL.revokeObjectURL(url);
+                        mjFetchInFlight = false;
+                    };
+                    img.src = url;
+                })
+                .catch(() => { mjFetchInFlight = false; });
+        }
+
         function onXRFrame(time, frame) {
             session.requestAnimationFrame(onXRFrame);
+            fetchMjFrame();
             
             const pose = frame.getViewerPose(refSpace);
             if (!pose) return;
@@ -319,6 +488,11 @@ HTML_TEMPLATE = '''
                         display += `${hand}: (${w.position.x.toFixed(2)}, ${w.position.y.toFixed(2)}, ${w.position.z.toFixed(2)})\n`;
                     }
                 }
+                const now = Date.now();
+                const okAge = lastOkAt ? ((now - lastOkAt) / 1000).toFixed(1) : 'n/a';
+                const errAge = lastErrAt ? ((now - lastErrAt) / 1000).toFixed(1) : 'n/a';
+                display += `send: inFlight=${inFlight} dropped=${droppedCount} errors=${errorCount}\n`;
+                display += `last ok: ${okAge}s ago | last err: ${errAge}s ago\n`;
                 dataDisplay.textContent = display;
             }
             
@@ -438,32 +612,164 @@ def index():
 @app.route('/hand_data', methods=['POST'])
 def receive_hand_data():
     global latest_hand_data
-    data = request.json
-    latest_hand_data = data
-    
-    # Log received data
-    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Hand data received:")
-    for hand_name, joints in data.get('hands', {}).items():
-        print(f"  {hand_name} hand - {len(joints)} joints tracked")
-        if 'wrist' in joints:
-            pos = joints['wrist']['position']
-            print(f"    Wrist position: ({pos['x']:.3f}, {pos['y']:.3f}, {pos['z']:.3f})")
-    
-    return jsonify({'status': 'success'})
+    start_time = time.monotonic()
+    try:
+        data = request.get_json(silent=True)
+        if data is None:
+            content_length = request.content_length or 0
+            _maybe_log_debug(
+                f"hand_data: invalid JSON payload content_length={content_length}"
+            )
+            return jsonify({"status": "error", "reason": "invalid_json"}), 400
+
+        remote_addr = request.headers.get("X-Forwarded-For", request.remote_addr)
+        user_agent = request.user_agent.string if request.user_agent else "unknown"
+        content_length = request.content_length or 0
+
+        with _stats_lock:
+            if _stats["last_request_from"] != remote_addr:
+                _stats["last_request_from"] = remote_addr
+                _maybe_log_debug(f"hand_data: new remote_addr={remote_addr}")
+            if _stats["last_user_agent"] != user_agent:
+                _stats["last_user_agent"] = user_agent
+                _maybe_log_debug(f"hand_data: user_agent={user_agent}")
+            _stats["last_content_length"] = content_length
+
+        latest_hand_data = data
+        now = datetime.now()
+
+        with _stats_lock:
+            _stats["hand_data_count"] += 1
+            _stats["last_hand_data_at"] = now
+            last_count = _stats["hand_data_count"]
+
+        # Rate-limited debug log (at most once per second)
+        global _last_log_time
+        if _debug_enabled and time.monotonic() - _last_log_time >= 1.0:
+            _last_log_time = time.monotonic()
+            hands = data.get("hands", {})
+            hand_list = ", ".join(hands.keys()) if hands else "none"
+            joint_counts = {
+                hand_name: len(joints) for hand_name, joints in hands.items()
+            }
+            _maybe_log_debug(
+                f"hand_data: count={last_count} hands={hand_list} joints={joint_counts} "
+                f"content_length={content_length}"
+            )
+            for hand_name, joints in hands.items():
+                if "wrist" in joints:
+                    pos = joints["wrist"]["position"]
+                    _maybe_log_debug(
+                        f"hand_data: {hand_name} wrist=({pos['x']:.3f}, "
+                        f"{pos['y']:.3f}, {pos['z']:.3f})"
+                    )
+            if not hands:
+                _maybe_log_debug("hand_data: payload has no hands")
+
+        return jsonify({"status": "success"})
+    except Exception as exc:
+        with _stats_lock:
+            _stats["last_error"] = f"{type(exc).__name__}: {exc}"
+        logger.exception("hand_data: exception while processing request")
+        return jsonify({"status": "error", "reason": "server_exception"}), 500
+    finally:
+        duration_ms = (time.monotonic() - start_time) * 1000.0
+        with _stats_lock:
+            _stats["last_request_duration_ms"] = duration_ms
+            _stats["max_request_duration_ms"] = max(
+                _stats["max_request_duration_ms"], duration_ms
+            )
+        if duration_ms > 50:
+            _maybe_log_debug(f"hand_data: slow request {duration_ms:.1f}ms")
 
 @app.route('/get_hand_data', methods=['GET'])
 def get_hand_data():
     return jsonify(latest_hand_data)
 
+
+@app.route('/mujoco_frame', methods=['POST'])
+def receive_mujoco_frame():
+    global _latest_frame
+    with _frame_lock:
+        _latest_frame = request.get_data()
+    return '', 204
+
+
+@app.route('/mujoco_frame', methods=['GET'])
+def serve_mujoco_frame():
+    with _frame_lock:
+        frame = _latest_frame
+    if frame is None:
+        return '', 204
+    return frame, 200, {'Content-Type': 'image/jpeg', 'Cache-Control': 'no-cache'}
+
+
+@app.route('/stats', methods=['GET'])
+def get_stats():
+    with _stats_lock:
+        stats_snapshot = dict(_stats)
+    if stats_snapshot["last_hand_data_at"]:
+        stats_snapshot["last_hand_data_at"] = stats_snapshot[
+            "last_hand_data_at"
+        ].isoformat()
+    return jsonify(stats_snapshot)
+
+
+def _get_lan_ip() -> str:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("8.8.8.8", 80))
+            return sock.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+
+
+def _maybe_start_ngrok(port: int) -> str | None:
+    if os.environ.get("USE_NGROK", "0") != "1":
+        return None
+    try:
+        from pyngrok import ngrok
+    except Exception as exc:
+        print(f"pyngrok not available: {exc}")
+        return None
+
+    authtoken = os.environ.get("NGROK_AUTHTOKEN")
+    if authtoken:
+        try:
+            ngrok.set_auth_token(authtoken)
+        except Exception as exc:
+            print(f"Failed to set ngrok authtoken: {exc}")
+            return None
+
+    try:
+        tunnel = ngrok.connect(port, "http")
+    except Exception as exc:
+        print(f"Failed to start ngrok tunnel: {exc}")
+        return None
+
+    return tunnel.public_url
+
+
 if __name__ == '__main__':
     print("Starting server...", flush=True)
+    faulthandler.enable()
+    if _debug_tracebacks:
+        faulthandler.dump_traceback_later(120, repeat=True)
+        _maybe_log_debug("faulthandler: periodic traceback dump enabled (120s)")
+    _start_watchdog()
     from waitress import serve
+    host = os.environ.get("HAND_TRACKER_HOST", "0.0.0.0")
+    port = int(os.environ.get("HAND_TRACKER_PORT", "9002"))
     print("=" * 50)
     print("WebXR Hand Tracking Server")
     print("=" * 50)
-    print("Open http://localhost:9002 in a WebXR-compatible browser")
+    print(f"Open http://localhost:{port} in a WebXR-compatible browser")
     print("Requires: VR headset with hand tracking (Meta Quest, etc.)")
     print("=" * 50)
-    print("Listening on http://0.0.0.0:9002 (Ctrl+C to stop)", flush=True)
-    app.run(host='0.0.0.0', port=9002)
-    serve(app, host='0.0.0.0', port=9002, connection_limit=5000, threads=16)
+    print(f"Listening on http://{host}:{port} (Ctrl+C to stop)", flush=True)
+    lan_ip = _get_lan_ip()
+    print(f"LAN address: http://{lan_ip}:{port}")
+    public_url = _maybe_start_ngrok(port)
+    if public_url:
+        print(f"Public tunnel: {public_url}")
+    serve(app, host=host, port=port, connection_limit=5000, threads=16)

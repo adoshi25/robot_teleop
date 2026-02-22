@@ -93,6 +93,8 @@ class PandaArmTrajectoryProcessor:
         self._robot = pk.Robot.from_urdf(urdf)
         self._target_link = "panda_hand"
 
+        self._warmup_ik()
+
     # -- internals ---------------------------------------------------------
 
     def _get_panda_joint_indices(self, side):
@@ -117,6 +119,15 @@ class PandaArmTrajectoryProcessor:
             for i in range(nq):
                 indices.append(int(qposadr) + i)
         return indices
+
+    def _warmup_ik(self):
+        """Run a dummy IK solve to trigger JAX JIT compilation at init time."""
+        dummy_pos = np.array([0.3, 0.0, 0.3])
+        dummy_q = self._default_start_joints["right"]
+        self._run_ik(
+            dummy_pos, "right",
+            initial_q=dummy_q, target_wxyz=self.ee_orientation,
+        )
 
     def _world_to_base(self, world_pos, side):
         return np.array(world_pos, dtype=float) - self._base_positions[side]
@@ -183,7 +194,12 @@ class PandaArmTrajectoryProcessor:
             skip_ik = False
             if last is not None:
                 dist = np.linalg.norm(base_pos - last)
-                if dist < self.min_point_distance:
+                ori_changed = (
+                    last_quat is not None
+                    and wxyz is not None
+                    and (1.0 - abs(float(np.dot(ori, last_quat)))) > 0.01
+                )
+                if dist < self.min_point_distance and not ori_changed:
                     skip_ik = True
                 elif dist > self.max_point_distance and self.interpolation_points > 0:
                     last_ori = last_quat if last_quat is not None else ori
@@ -200,7 +216,8 @@ class PandaArmTrajectoryProcessor:
                             last_q = q
 
             if not skip_ik:
-                q = self._run_ik(base_pos, side, initial_q=last_q, target_wxyz=ori)
+                init_q = last_q if last_q is not None else self._default_start_joints[side]
+                q = self._run_ik(base_pos, side, initial_q=init_q, target_wxyz=ori)
                 if q is not None:
                     self._update_ema(side, q)
                     self._last_point[side] = base_pos.copy()

@@ -1,195 +1,733 @@
 #!/usr/bin/env python3
-"""
-MuJoCo Hand Tracking Visualizer
+"""WebXR hand tracking → MuJoCo IK visualizer.
 
-This script visualizes hand tracking data from the WebXR hand tracking server
-by updating mocap bodies in a MuJoCo simulation.
+Press SPACE to start. After a 2.5s warmup (hold hands steady), the offset
+between your WebXR wrist and the robot's canonical pose is locked in.
+All subsequent hand motion is 1:1 relative to that anchor.
 
 Usage:
-    1. Start the hand tracking server: python tools/start_hand_tracker.py
-    2. Connect VR headset and start hand tracking in browser
-    3. Run this script: python tools/visualize_hand_tracking.py
+    1. python teleop/start_hand_tracker.py
+    2. Connect VR headset, start hand tracking in browser
+    3. mjpython run_visualize_tesollo.py   (or run this directly)
 """
 
+import argparse
+import io
 import sys
-import mujoco
-import mujoco.viewer
-import requests
-import numpy as np
 import time
 from pathlib import Path
 
+import mujoco
+import mujoco.viewer
+import numpy as np
+import requests
+from PIL import Image
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from calibration import PandaCalibrator
+from panda_telelop import PandaArmTrajectoryProcessor
 
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
 
-# Configuration
 HAND_TRACKER_URL = "http://localhost:9002/get_hand_data"
-MJCF_PATH = Path(__file__).parent.parent / "teleop" / "robots" / "dg5f_dual_panda.mjcf.xml"
-UPDATE_FREQUENCY = 60  # Hz
+FRAME_POST_URL = "http://localhost:9002/mujoco_frame"
+FRAME_POST_HZ = 15
+OFFSCREEN_WIDTH = 640
+OFFSCREEN_HEIGHT = 480
+DEFAULT_MJCF = (
+    Path(__file__).parent.parent / "teleop" / "robots" / "dg5f_dual_panda.mjcf.xml"
+)
+CONTROL_HZ = 60
+WARMUP_SECONDS = 2.5
+MAX_JOINT_DELTA = 3  # radians — reject IK solutions that jump more than this per frame
 
-# Mapping from WebXR joint names to MuJoCo mocap body names
-JOINT_TO_MOCAP_MAPPING = {
-    'left': {
-        'wrist': 'left-wrist',
-        'thumb-tip': 'left-thumb-tip',
-        'index-finger-tip': 'left-index-finger-tip',
-        'middle-finger-tip': 'left-middle-finger-tip',
-        'ring-finger-tip': 'left-ring-finger-tip',
-        'pinky-finger-tip': 'left-pinky-finger-tip',
-    },
-    'right': {
-        'wrist': 'right-wrist',
-        'thumb-tip': 'right-thumb-tip',
-        'index-finger-tip': 'right-index-finger-tip',
-        'middle-finger-tip': 'right-middle-finger-tip',
-        'ring-finger-tip': 'right-ring-finger-tip',
-        'pinky-finger-tip': 'right-pinky-finger-tip',
-    }
+JOINT_NAMES = [
+    "wrist",
+    "thumb-tip",
+    "index-finger-tip",
+    "middle-finger-tip",
+    "ring-finger-tip",
+    "pinky-finger-tip",
+]
+
+MOCAP_BODIES = {
+    side: {j: f"{side}-{j}" for j in JOINT_NAMES} for side in ("left", "right")
 }
 
-ROTATION_X90 = np.array([np.sqrt(2)/2, np.sqrt(2)/2, 0, 0])
+ROBOT_SITES = {
+    "left": {
+        "wrist": "left_palm_site",
+        "thumb-tip": "left_thumb_tip_site",
+        "index-finger-tip": "left_index_tip_site",
+        "middle-finger-tip": "left_middle_tip_site",
+        "ring-finger-tip": "left_ring_tip_site",
+        "pinky-finger-tip": "left_pinky_tip_site",
+    },
+    "right": {
+        "wrist": "right_palm_site",
+        "thumb-tip": "right_thumb_tip_site",
+        "index-finger-tip": "right_index_tip_site",
+        "middle-finger-tip": "right_middle_tip_site",
+        "ring-finger-tip": "right_ring_tip_site",
+        "pinky-finger-tip": "right_pinky_tip_site",
+    },
+}
+
+FINGER_KEYPOINTS = {
+    "thumb": [
+        "thumb-metacarpal", "thumb-phalanx-proximal",
+        "thumb-phalanx-distal", "thumb-tip",
+    ],
+    "index": [
+        "index-finger-metacarpal", "index-finger-phalanx-proximal",
+        "index-finger-phalanx-intermediate", "index-finger-phalanx-distal",
+        "index-finger-tip",
+    ],
+    "middle": [
+        "middle-finger-metacarpal", "middle-finger-phalanx-proximal",
+        "middle-finger-phalanx-intermediate", "middle-finger-phalanx-distal",
+        "middle-finger-tip",
+    ],
+    "ring": [
+        "ring-finger-metacarpal", "ring-finger-phalanx-proximal",
+        "ring-finger-phalanx-intermediate", "ring-finger-phalanx-distal",
+        "ring-finger-tip",
+    ],
+    "pinky": [
+        "pinky-finger-metacarpal", "pinky-finger-phalanx-proximal",
+        "pinky-finger-phalanx-intermediate", "pinky-finger-phalanx-distal",
+        "pinky-finger-tip",
+    ],
+}
+
+FINGER_JOINT_NAMES = {
+    "left": {
+        "thumb":  ["lj_dg_1_1", "lj_dg_1_2", "lj_dg_1_3", "lj_dg_1_4"],
+        "index":  ["lj_dg_2_1", "lj_dg_2_2", "lj_dg_2_3", "lj_dg_2_4"],
+        "middle": ["lj_dg_3_1", "lj_dg_3_2", "lj_dg_3_3", "lj_dg_3_4"],
+        "ring":   ["lj_dg_4_1", "lj_dg_4_2", "lj_dg_4_3", "lj_dg_4_4"],
+        "pinky":  ["lj_dg_5_1", "lj_dg_5_2", "lj_dg_5_3", "lj_dg_5_4"],
+    },
+    "right": {
+        "thumb":  ["rj_dg_1_1", "rj_dg_1_2", "rj_dg_1_3", "rj_dg_1_4"],
+        "index":  ["rj_dg_2_1", "rj_dg_2_2", "rj_dg_2_3", "rj_dg_2_4"],
+        "middle": ["rj_dg_3_1", "rj_dg_3_2", "rj_dg_3_3", "rj_dg_3_4"],
+        "ring":   ["rj_dg_4_1", "rj_dg_4_2", "rj_dg_4_3", "rj_dg_4_4"],
+        "pinky":  ["rj_dg_5_1", "rj_dg_5_2", "rj_dg_5_3", "rj_dg_5_4"],
+    },
+}
+
+# Maps inter-bone-angle index → robot joint index (0-based within the 4 joints).
+# Thumb: 4 keypoints → 3 bones → 2 angles → joints _3,_4 (flexion only)
+# Index/middle/ring: 5 kp → 4 bones → 3 angles → joints _2,_3,_4
+# Pinky: 5 kp → 4 bones → 3 angles → skip MCP, joints _3,_4
+FINGER_ANGLE_TO_JOINT = {
+    "thumb":  {0: 2, 1: 3},
+    "index":  {0: 1, 1: 2, 2: 3},
+    "middle": {0: 1, 1: 2, 2: 3},
+    "ring":   {0: 1, 1: 2, 2: 3},
+    "pinky":  {1: 2, 2: 3},
+}
+
+# Abduction: proximal → intermediate bone direction, projected onto palm plane.
+# j_idx is the joint index within the 4-joint chain that controls abduction.
+# Index/middle/ring: joint 0 (axis X). Pinky: joint 1 (lj_dg_5_2, axis X).
+_ABD_FINGERS = [
+    ("index",  "index-finger-phalanx-proximal",  "index-finger-phalanx-intermediate",  0),
+    ("middle", "middle-finger-phalanx-proximal",  "middle-finger-phalanx-intermediate", 0),
+    ("ring",   "ring-finger-phalanx-proximal",    "ring-finger-phalanx-intermediate",   0),
+    ("pinky",  "pinky-finger-phalanx-proximal",   "pinky-finger-phalanx-intermediate",  1),
+]
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 
-def quat_multiply(q1, q2):
+def webxr_to_mujoco(pos_dict):
+    """WebXR {x,y,z} → MuJoCo frame (-z, x, y).
+
+    WebXR: X=right, Y=up, Z=toward user.
+    MuJoCo scene: X=forward, Y=left/right, Z=up.
+    """
+    return np.array([-pos_dict["z"], pos_dict["x"], pos_dict["y"]])
+
+
+def webxr_quat_to_mujoco_wxyz(ori_dict):
+    """WebXR orientation {x,y,z,w} (xyzw) → MuJoCo wxyz quaternion.
+
+    The position axes remap as (-Z, X, Y) which has det=-1 (improper).
+    For the rotation axis we apply the same remapping, then conjugate
+    to account for the handedness flip.
+    """
+    return np.array([
+        ori_dict["w"],
+        ori_dict["z"],
+        -ori_dict["x"],
+        -ori_dict["y"],
+    ])
+
+
+def _qmul(q1, q2):
+    """Hamilton product of two wxyz quaternions."""
     w1, x1, y1, z1 = q1
     w2, x2, y2, z2 = q2
     return np.array([
         w1*w2 - x1*x2 - y1*y2 - z1*z2,
         w1*x2 + x1*w2 + y1*z2 - z1*y2,
         w1*y2 - x1*z2 + y1*w2 + z1*x2,
-        w1*z2 + x1*y2 - y1*x2 + z1*w2
+        w1*z2 + x1*y2 - y1*x2 + z1*w2,
     ])
 
 
-def rotate_position_x90(position):
-    x, y, z = position
-    return np.array([x, -z, y])
+def _qinv(q):
+    """Conjugate (inverse for unit quaternions) in wxyz format."""
+    return np.array([q[0], -q[1], -q[2], -q[3]])
 
 
-def fetch_hand_data():
-    """Fetch hand tracking data from the server."""
+def fetch_hands():
     try:
-        response = requests.get(HAND_TRACKER_URL, timeout=0.1)
-        if response.status_code == 200:
-            data = response.json()
-            if data and 'hands' in data:
-                return data['hands']
+        r = requests.get(HAND_TRACKER_URL, timeout=0.1)
+        if r.ok:
+            d = r.json()
+            if d and "hands" in d:
+                return d["hands"]
     except (requests.RequestException, ValueError):
         pass
     return None
 
 
-def update_mocap_from_hand_data(model, data, hand_data, calibrator):
-    """Update MuJoCo mocap bodies with hand tracking data."""
-    if not hand_data:
-        return
+def read_canonical_positions(model, data):
+    """FK positions of every tracked site at the current qpos."""
+    out = {}
+    for side, joints in ROBOT_SITES.items():
+        out[side] = {}
+        for jname, sname in joints.items():
+            out[side][jname] = data.site_xpos[model.site(sname).id].copy()
+    return out
 
-    for hand_name, joints in hand_data.items():
-        if hand_name not in JOINT_TO_MOCAP_MAPPING:
+
+def compute_offsets(hand_data, canonical):
+    """Per-joint offset so that initial WebXR pose maps onto canonical FK."""
+    offsets = {}
+    for side in ("left", "right"):
+        joints = hand_data.get(side)
+        if not joints:
+            continue
+        offsets[side] = {}
+        for jname in JOINT_NAMES:
+            jd = joints.get(jname)
+            canon = canonical.get(side, {}).get(jname)
+            if jd and "position" in jd and canon is not None:
+                offsets[side][jname] = canon - webxr_to_mujoco(jd["position"])
+        wrist = joints.get("wrist")
+        if wrist and "orientation" in wrist:
+            offsets[side]["_wrist_quat_cal"] = webxr_quat_to_mujoco_wxyz(
+                wrist["orientation"]
+            )
+    return offsets
+
+
+def get_offset_wrist(hand_data, side, offsets):
+    """Offset-corrected wrist position in world frame, or None."""
+    joints = hand_data.get(side)
+    off = offsets.get(side, {}).get("wrist")
+    if joints is None or off is None:
+        return None
+    w = joints.get("wrist")
+    if w is None or "position" not in w:
+        return None
+    return webxr_to_mujoco(w["position"]) + off
+
+
+def compute_wrist_roll(hand_joints, side, offsets):
+    """Extract wrist roll angle (twist around forearm axis) relative to calibration.
+
+    Uses the direction from wrist to middle-finger-metacarpal as the
+    forearm/twist axis, then decomposes the relative orientation
+    quaternion to pull out only the rotation around that axis.
+    """
+    wrist = hand_joints.get("wrist")
+    q_cal = offsets.get(side, {}).get("_wrist_quat_cal")
+    if wrist is None or "orientation" not in wrist or q_cal is None:
+        return None
+
+    q_cur = webxr_quat_to_mujoco_wxyz(wrist["orientation"])
+    q_rel = _qmul(q_cur, _qinv(q_cal))
+
+    mid_meta = hand_joints.get("middle-finger-metacarpal")
+    if mid_meta and "position" in mid_meta:
+        wrist_pos = webxr_to_mujoco(wrist["position"])
+        meta_pos = webxr_to_mujoco(mid_meta["position"])
+        fwd = meta_pos - wrist_pos
+        norm = np.linalg.norm(fwd)
+        twist_axis = fwd / norm if norm > 1e-6 else np.array([0.0, 1.0, 0.0])
+    else:
+        twist_axis = np.array([0.0, 1.0, 0.0])
+
+    p = float(np.dot(q_rel[1:4], twist_axis))
+    return -2.0 * np.arctan2(p, float(q_rel[0]))
+
+
+def build_finger_index_map(model):
+    """Build {(side, finger, joint_idx): (qpos_idx, lo, hi)} for all finger joints."""
+    result = {}
+    for side, fingers in FINGER_JOINT_NAMES.items():
+        for finger_name, joint_names in fingers.items():
+            for j_idx, jname in enumerate(joint_names):
+                jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, jname)
+                if jid < 0:
+                    continue
+                qpos_idx = int(model.jnt_qposadr[jid])
+                lo = float(model.jnt_range[jid, 0])
+                hi = float(model.jnt_range[jid, 1])
+                result[(side, finger_name, j_idx)] = (qpos_idx, lo, hi)
+    return result
+
+
+def _get_pos(hand_joints, name):
+    kp = hand_joints.get(name)
+    if kp and "position" in kp:
+        return webxr_to_mujoco(kp["position"])
+    return None
+
+
+def _build_palm_frame(hand_joints):
+    """Build an orthonormal palm frame (forward, lateral, normal) from keypoints.
+
+    forward  = wrist → middle-finger-metacarpal  (along fingers)
+    lateral  = index-metacarpal → pinky-metacarpal (orthogonalised)
+    normal   = cross(forward, lateral)             (out of palm)
+
+    Returns (forward, lateral, normal) unit vectors, or None.
+    """
+    wrist_pos = _get_pos(hand_joints, "wrist")
+    mid_meta = _get_pos(hand_joints, "middle-finger-metacarpal")
+    idx_meta = _get_pos(hand_joints, "index-finger-metacarpal")
+    pinky_meta = _get_pos(hand_joints, "pinky-finger-metacarpal")
+
+    if any(p is None for p in (wrist_pos, mid_meta, idx_meta, pinky_meta)):
+        return None
+
+    fwd = mid_meta - wrist_pos
+    fwd_n = np.linalg.norm(fwd)
+    if fwd_n < 1e-6:
+        return None
+    fwd = fwd / fwd_n
+
+    lat = pinky_meta - idx_meta
+    lat -= np.dot(lat, fwd) * fwd
+    lat_n = np.linalg.norm(lat)
+    if lat_n < 1e-6:
+        return None
+    lat = lat / lat_n
+
+    nrm = np.cross(fwd, lat)
+    return fwd, lat, nrm
+
+
+def calibrate_abduction_rest(hand_data):
+    """Record per-finger lateral angles at calibration (rest) pose.
+
+    Returns {(side, finger_name): rest_angle}.
+    """
+    rest = {}
+    for side in ("left", "right"):
+        joints = hand_data.get(side)
+        if not joints:
+            continue
+        frame = _build_palm_frame(joints)
+        if frame is None:
+            continue
+        fwd, lat, nrm = frame
+
+        for fname, prox_name, inter_name, _j_idx in _ABD_FINGERS:
+            prox = _get_pos(joints, prox_name)
+            inter = _get_pos(joints, inter_name)
+            if prox is None or inter is None:
+                continue
+            bone = inter - prox
+            bone -= np.dot(bone, nrm) * nrm
+            bn = np.linalg.norm(bone)
+            if bn < 1e-6:
+                continue
+            bone = bone / bn
+            rest[(side, fname)] = float(np.arctan2(
+                np.dot(bone, lat), np.dot(bone, fwd)
+            ))
+    return rest
+
+
+def _compute_abduction(hand_joints, side, finger_map, result, abd_rest):
+    """Compute abduction from lateral deviation of proximal phalanx.
+
+    For each finger, projects the proximal bone onto the palm plane and
+    measures its lateral angle.  The abduction is the change from the
+    calibration-time rest angle, which naturally handles the default
+    finger splay.
+    """
+    frame = _build_palm_frame(hand_joints)
+    if frame is None:
+        return
+    fwd, lat, nrm = frame
+
+    for fname, prox_name, inter_name, j_idx in _ABD_FINGERS:
+        prox = _get_pos(hand_joints, prox_name)
+        inter = _get_pos(hand_joints, inter_name)
+        if prox is None or inter is None:
+            continue
+        bone = inter - prox
+        bone -= np.dot(bone, nrm) * nrm
+        bn = np.linalg.norm(bone)
+        if bn < 1e-6:
+            continue
+        bone = bone / bn
+
+        angle = float(np.arctan2(np.dot(bone, lat), np.dot(bone, fwd)))
+        rest_angle = abd_rest.get((side, fname), angle)
+        side_sign = -1.0 if side == "left" else 1.0
+        abd = side_sign * (angle - rest_angle)
+
+        key = (side, fname, j_idx)
+        if key not in finger_map:
+            continue
+        qpos_idx, lo, hi = finger_map[key]
+        result[qpos_idx] = float(np.clip(abd, lo, hi))
+
+
+def retarget_fingers(hand_joints, side, finger_map, abd_rest):
+    """Compute finger joint angles from WebXR keypoint positions.
+
+    Returns {qpos_index: angle} for all 20 finger joints on one hand.
+    """
+    result = {}
+
+    for finger_name, kp_names in FINGER_KEYPOINTS.items():
+        positions = []
+        for kp_name in kp_names:
+            kp = hand_joints.get(kp_name)
+            if kp is None or "position" not in kp:
+                break
+            positions.append(webxr_to_mujoco(kp["position"]))
+
+        if len(positions) < len(kp_names):
             continue
 
-        joint_mapping = JOINT_TO_MOCAP_MAPPING[hand_name]
+        bones = [positions[i + 1] - positions[i] for i in range(len(positions) - 1)]
 
-        # On the first frame of a trajectory, capture all initial positions at once
-        if not calibrator.is_initial_captured(hand_name):
-            initial_positions = {}
-            for joint_name in joint_mapping:
-                if joint_name in joints:
-                    jd = joints[joint_name]
-                    if jd and 'position' in jd:
-                        pos = jd['position']
-                        initial_positions[joint_name] = rotate_position_x90(
-                            np.array([pos['x'], pos['y'], pos['z']])
-                        )
-            if initial_positions:
-                calibrator.capture_initial_positions(hand_name, initial_positions)
+        flexion_angles = []
+        for i in range(len(bones) - 1):
+            n1 = bones[i] / (np.linalg.norm(bones[i]) + 1e-8)
+            n2 = bones[i + 1] / (np.linalg.norm(bones[i + 1]) + 1e-8)
+            cos_a = np.clip(np.dot(n1, n2), -1.0, 1.0)
+            flexion_angles.append(float(np.arccos(cos_a)))
 
-        for joint_name, mocap_name in joint_mapping.items():
-            if joint_name not in joints:
+        angle_map = FINGER_ANGLE_TO_JOINT.get(finger_name, {})
+
+        for angle_idx, joint_idx in angle_map.items():
+            if angle_idx >= len(flexion_angles):
                 continue
-
-            joint_data = joints[joint_name]
-            if not joint_data or 'position' not in joint_data:
+            key = (side, finger_name, joint_idx)
+            if key not in finger_map:
                 continue
+            qpos_idx, lo, hi = finger_map[key]
+            angle = flexion_angles[angle_idx]
+            if hi <= 0 or (finger_name == "thumb" and side == "left"):
+                angle = -angle
+            result[qpos_idx] = float(np.clip(angle, lo, hi))
 
+        for j_idx in range(4):
+            if j_idx not in angle_map.values():
+                key = (side, finger_name, j_idx)
+                if key in finger_map:
+                    qpos_idx, lo, hi = finger_map[key]
+                    if qpos_idx not in result:
+                        result[qpos_idx] = float(np.clip(0.0, lo, hi))
+
+    _compute_abduction(hand_joints, side, finger_map, result, abd_rest)
+
+    return result
+
+
+def sync_mocap_to_sites(model, data):
+    """Position red-dot mocap bodies at the robot's current FK site positions."""
+    for side in ("left", "right"):
+        for jname, site_name in ROBOT_SITES[side].items():
+            mocap_name = MOCAP_BODIES[side].get(jname)
+            if mocap_name is None:
+                continue
             try:
-                mocap_id = model.body(mocap_name).mocapid[0]
-                if mocap_id < 0:
-                    continue
-            except KeyError:
-                continue
+                mid = model.body(mocap_name).mocapid[0]
+                sid = model.site(site_name).id
+                if mid >= 0:
+                    data.mocap_pos[mid] = data.site_xpos[sid].copy()
+            except (KeyError, IndexError):
+                pass
 
-            pos = joint_data['position']
-            position = rotate_position_x90(np.array([pos['x'], pos['y'], pos['z']]))
-            position = calibrator.transform_position(hand_name, joint_name, position)
 
-            data.mocap_pos[mocap_id] = position
-
-            if 'orientation' in joint_data:
-                quat = joint_data['orientation']
-                quat_wxyz = np.array([quat['w'], quat['x'], quat['y'], quat['z']])
-                data.mocap_quat[mocap_id] = quat_wxyz
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 
 def main():
-    """Main visualization loop."""
-    if not MJCF_PATH.exists():
-        print(f"Error: MJCF file not found at {MJCF_PATH}")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mjcf-path", type=str, default=None)
+    parser.add_argument("--reanchor", action="store_true", default=False,
+                        help="Re-anchor wrist offset on large IK jumps instead of freezing")
+    parser.add_argument(
+        "--raw-ik",
+        action="store_true",
+        default=False,
+        help="Disable smoothing/interpolation and run plain per-frame IK",
+    )
+    args = parser.parse_args()
+
+    mjcf_path = Path(args.mjcf_path) if args.mjcf_path else DEFAULT_MJCF
+    if not mjcf_path.exists():
+        print(f"Error: {mjcf_path} not found")
         return
 
-    print(f"Loading MuJoCo model from {MJCF_PATH}")
-    model = mujoco.MjModel.from_xml_path(str(MJCF_PATH))
+    model = mujoco.MjModel.from_xml_path(str(mjcf_path))
     data = mujoco.MjData(model)
-
     mujoco.mj_resetDataKeyframe(model, data, 0)
+    mujoco.mj_forward(model, data)
 
-    calibrator = PandaCalibrator()
-    calibrator.init_simulator(model, data)
+    free_nq = 0
+    free_nv = 0
+    for j in range(model.njnt):
+        if model.jnt_type[j] == mujoco.mjtJoint.mjJNT_FREE:
+            free_nq += 7
+            free_nv += 6
 
-    def key_callback(key):
-        calibrator.handle_key(key)
+    # Offscreen renderer for streaming to VR headset
+    offscreen = mujoco.Renderer(model, height=OFFSCREEN_HEIGHT, width=OFFSCREEN_WIDTH)
+    offscreen_cam = mujoco.MjvCamera()
+    offscreen_cam.type = mujoco.mjtCamera.mjCAMERA_FREE
+    offscreen_cam.distance = 2.0
+    offscreen_cam.azimuth = 180
+    offscreen_cam.elevation = -30
+    offscreen_cam.lookat[:] = [0.75, 0.0, 0.35]
+    last_frame_post = [0.0]
 
-    print(f"Model loaded successfully")
-    print(f"Connecting to hand tracking server at {HAND_TRACKER_URL}")
-    print(f"Update frequency: {UPDATE_FREQUENCY} Hz")
-    print("")
-    print("Controls:")
-    print("  - Press SPACE to start/stop trajectory")
-    print("  - Right-click and drag to rotate camera")
-    print("  - Scroll to zoom")
-    print("  - Press ESC or close window to exit")
-    print("")
+    def maybe_post_frame(t):
+        if t - last_frame_post[0] < 1.0 / FRAME_POST_HZ:
+            return
+        try:
+            offscreen.update_scene(data, camera=offscreen_cam)
+            pixels = offscreen.render()
+            buf = io.BytesIO()
+            Image.fromarray(pixels).save(buf, format="JPEG", quality=70)
+            requests.post(
+                FRAME_POST_URL,
+                data=buf.getvalue(),
+                headers={"Content-Type": "image/jpeg"},
+                timeout=0.05,
+            )
+        except Exception:
+            pass
+        last_frame_post[0] = t
 
-    test_data = fetch_hand_data()
-    if test_data is None:
-        print("Warning: Could not connect to hand tracking server.")
-        print("Make sure the server is running: python tools/start_hand_tracker.py")
-        print("Continuing anyway - will keep trying to connect...")
+    canonical = read_canonical_positions(model, data)
+    for side in ("left", "right"):
+        for jn, pos in canonical[side].items():
+            print(f"  canonical {side} {jn}: {pos}")
+
+    # IK processor
+    if args.raw_ik:
+        proc = PandaArmTrajectoryProcessor(
+            scene_path=mjcf_path,
+            control_hz=CONTROL_HZ,
+            min_point_distance=0.0,
+            max_point_distance=1e9,
+            interpolation_points=0,
+            smoothing_alpha=1.0,
+            smoothing_sigma=0.0,
+        )
     else:
-        print(f"Successfully connected! Currently tracking: {list(test_data.keys())}")
+        proc = PandaArmTrajectoryProcessor(scene_path=mjcf_path, control_hz=CONTROL_HZ)
+    arm_idx = {s: proc.get_mujoco_qpos_indices(s) for s in ("left", "right")}
+    ik_q = {"left": None, "right": None}
+    prev_ik_q = {"left": None, "right": None}
 
-    print("")
+    # Joint 7 (wrist roll) — driven directly from WebXR orientation, not IK
+    j7_qidx = {}
+    j7_range = {}
+    for side in ("left", "right"):
+        idx = arm_idx[side][6]
+        j7_qidx[side] = idx
+        for jid in range(model.njnt):
+            if int(model.jnt_qposadr[jid]) == idx:
+                j7_range[side] = (float(model.jnt_range[jid, 0]),
+                                  float(model.jnt_range[jid, 1]))
+                break
+    wrist_roll = {"left": 0.0, "right": 0.0}
 
-    last_update_time = 0
-    update_interval = 1.0 / UPDATE_FREQUENCY
+    # Finger retargeting
+    finger_map = build_finger_index_map(model)
+    finger_qpos = {"left": {}, "right": {}}
+    abd_rest = [{}]
 
-    with mujoco.viewer.launch_passive(model, data, key_callback=key_callback) as viewer:
-        while viewer.is_running():
-            current_time = time.time()
+    reanchor = {"left": False, "right": False}
+    latest_webxr_wrist = {"left": None, "right": None}
 
-            if calibrator.trajectory_active:
-                if current_time - last_update_time >= update_interval:
-                    hand_data = fetch_hand_data()
-                    update_mocap_from_hand_data(model, data, hand_data, calibrator)
-                    last_update_time = current_time
-                data.ctrl[:] = 0
-                mujoco.mj_step(model, data)
-            else:
-                calibrator.hold_canonical_pose()
+    def on_ik(side, q, _t):
+        prev = prev_ik_q[side]
+        if prev is not None and np.max(np.abs(q - prev)) > MAX_JOINT_DELTA:
+            if args.reanchor:
+                reanchor[side] = True
+            return
+        ik_q[side] = q.copy()
+        prev_ik_q[side] = q.copy()
+
+    proc.register_callback(on_ik)
+
+    # State -----------------------------------------------------------------
+    active = [False]
+    t_start = [0.0]
+    offsets = [{}]
+    warmup_done = [False]
+    warmup_data = [None]
+    last_fetch = [0.0]
+    dt = 1.0 / CONTROL_HZ
+
+    def on_key(key):
+        if key != 32:
+            return
+        if not active[0]:
+            active[0] = True
+            t_start[0] = time.time()
+            offsets[0] = {}
+            warmup_done[0] = False
+            warmup_data[0] = None
+            proc.start_trajectory()
+            ik_q["left"] = ik_q["right"] = None
+            prev_ik_q["left"] = prev_ik_q["right"] = None
+            finger_qpos["left"] = finger_qpos["right"] = {}
+            abd_rest[0] = {}
+            reanchor["left"] = reanchor["right"] = False
+            latest_webxr_wrist["left"] = latest_webxr_wrist["right"] = None
+            wrist_roll["left"] = wrist_roll["right"] = 0.0
+            print(f"Warmup {WARMUP_SECONDS}s — hold hands steady...")
+        else:
+            active[0] = False
+            proc.clear_trajectory()
+            ik_q["left"] = ik_q["right"] = None
+            prev_ik_q["left"] = prev_ik_q["right"] = None
+            finger_qpos["left"] = finger_qpos["right"] = {}
+            abd_rest[0] = {}
+            reanchor["left"] = reanchor["right"] = False
+            latest_webxr_wrist["left"] = latest_webxr_wrist["right"] = None
+            wrist_roll["left"] = wrist_roll["right"] = 0.0
+            print("Stopped.")
+
+    if fetch_hands() is None:
+        print("Warning: hand tracker not reachable.")
+    else:
+        print("Hand tracker connected.")
+    print("\nSPACE = start/stop  |  ESC = quit\n")
+
+    with mujoco.viewer.launch_passive(model, data, key_callback=on_key) as v:
+        while v.is_running():
+            now = time.time()
+
+            # ------ idle ---------------------------------------------------
+            if not active[0]:
+                mujoco.mj_resetDataKeyframe(model, data, 0)
                 mujoco.mj_forward(model, data)
+                sync_mocap_to_sites(model, data)
+                maybe_post_frame(now)
+                v.sync()
+                time.sleep(0.001)
+                continue
 
-            viewer.sync()
+            elapsed = now - t_start[0]
+
+            # ------ warmup -------------------------------------------------
+            if elapsed < WARMUP_SECONDS:
+                hd = fetch_hands()
+                if hd:
+                    warmup_data[0] = hd
+                mujoco.mj_resetDataKeyframe(model, data, 0)
+                mujoco.mj_forward(model, data)
+                sync_mocap_to_sites(model, data)
+                maybe_post_frame(now)
+                v.sync()
+                time.sleep(0.001)
+                continue
+
+            # ------ warmup → tracking transition --------------------------
+            if not warmup_done[0]:
+                warmup_done[0] = True
+                hd = warmup_data[0] or fetch_hands()
+                if hd:
+                    offsets[0] = compute_offsets(hd, canonical)
+                    for side, so in offsets[0].items():
+                        w = so.get("wrist")
+                        if w is not None:
+                            print(f"  {side} wrist offset: {w}")
+                    abd_rest[0] = calibrate_abduction_rest(hd)
+                    print(f"  abduction rest angles: {abd_rest[0]}")
+                print("Tracking active!")
+
+            # ------ tracking -----------------------------------------------
+            if now - last_fetch[0] >= dt:
+                hand_data = fetch_hands()
+                if hand_data and offsets[0]:
+                    for side in ("left", "right"):
+                        joints = hand_data.get(side)
+                        if joints:
+                            w = joints.get("wrist")
+                            if w and "position" in w:
+                                latest_webxr_wrist[side] = w["position"]
+
+                        if (reanchor[side]
+                                and latest_webxr_wrist[side] is not None
+                                and side in offsets[0]):
+                            site_name = ROBOT_SITES[side]["wrist"]
+                            robot_pos = data.site_xpos[
+                                model.site(site_name).id
+                            ].copy()
+                            new_off = robot_pos - webxr_to_mujoco(
+                                latest_webxr_wrist[side]
+                            )
+                            offsets[0][side]["wrist"] = new_off
+                            prev_ik_q[side] = None
+                            reanchor[side] = False
+
+                        wrist = get_offset_wrist(hand_data, side, offsets[0])
+                        if wrist is not None:
+                            proc.add_point(wrist, side)
+                        if joints:
+                            finger_qpos[side] = retarget_fingers(
+                                joints, side, finger_map, abd_rest[0]
+                            )
+                            roll = compute_wrist_roll(joints, side, offsets[0])
+                            if roll is not None:
+                                wrist_roll[side] = roll
+                last_fetch[0] = now
+
+            for side in ("left", "right"):
+                q = ik_q[side]
+                if q is not None:
+                    data.qpos[arm_idx[side]] = q
+                lo, hi = j7_range[side]
+                data.qpos[j7_qidx[side]] = np.clip(
+                    data.qpos[j7_qidx[side]] + wrist_roll[side], lo, hi
+                )
+                for qidx, angle in finger_qpos[side].items():
+                    data.qpos[qidx] = angle
+
+            robot_qpos = data.qpos[free_nq:].copy()
+            mujoco.mj_step(model, data)
+            data.qpos[free_nq:] = robot_qpos
+            data.qvel[free_nv:] = 0
+            mujoco.mj_forward(model, data)
+            sync_mocap_to_sites(model, data)
+            maybe_post_frame(now)
+
+            v.sync()
             time.sleep(0.001)
 
 
