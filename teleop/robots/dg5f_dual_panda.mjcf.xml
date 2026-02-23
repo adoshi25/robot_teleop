@@ -528,7 +528,7 @@
     <light name="fill" pos="1.25 -1.4 1.0" dir="-0.8 0.5 -0.6" cutoff="60" diffuse="0.18 0.18 0.18" directional="true"/>
     <light name="back" pos="-0.35000000000000003 -0.7 1.7999999999999998" dir="-1 0 1" cutoff="50" diffuse="0.5 0.5 0.5" directional="true"/>
     <body name="concrete-slab" pos="0 0 0.6">
-    <geom name="concrete-slab-concrete" type="box" group="1" material="concrete-slab-concrete" size="0.7 0.7 0.05" pos="0 0 -"/>
+    <geom name="concrete-slab-concrete" type="box" group="1" material="concrete-slab-concrete" size="0.7 0.7 0.05" pos="0 0 0"/>
     </body>
     <body name="box" pos="0.6 0 0.9">
       <inertial pos="0 0 0" mass="0.1" diaginertia="0.001 0.001 0.001" />

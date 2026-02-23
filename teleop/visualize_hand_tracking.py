@@ -14,6 +14,7 @@ Usage:
 import argparse
 import io
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -40,7 +41,7 @@ DEFAULT_MJCF = (
 )
 CONTROL_HZ = 60
 WARMUP_SECONDS = 2.5
-MAX_JOINT_DELTA = 0.5  # radians — reject IK solutions that jump more than this per frame
+MAX_JOINT_DELTA = 0.5
 
 JOINT_NAMES = [
     "wrist",
@@ -131,8 +132,6 @@ FINGER_ANGLE_TO_JOINT = {
 }
 
 # Abduction: proximal → intermediate bone direction, projected onto palm plane.
-# j_idx is the joint index within the 4-joint chain that controls abduction.
-# Index/middle/ring: joint 0 (axis X). Pinky: joint 1 (lj_dg_5_2, axis X).
 _ABD_FINGERS = [
     ("index",  "index-finger-phalanx-proximal",  "index-finger-phalanx-intermediate",  0),
     ("middle", "middle-finger-phalanx-proximal",  "middle-finger-phalanx-intermediate", 0),
@@ -141,25 +140,19 @@ _ABD_FINGERS = [
 ]
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Coordinate / quaternion helpers
 # ---------------------------------------------------------------------------
 
 
 def webxr_to_mujoco(pos_dict):
-    """WebXR {x,y,z} → MuJoCo frame (-z, x, y).
-
-    WebXR: X=right, Y=up, Z=toward user.
-    MuJoCo scene: X=forward, Y=left/right, Z=up.
-    """
+    """WebXR {x,y,z} → MuJoCo frame (-z, x, y)."""
     return np.array([-pos_dict["x"], pos_dict["z"], pos_dict["y"]])
 
 
 def webxr_quat_to_mujoco_wxyz(ori_dict):
     """WebXR orientation {x,y,z,w} (xyzw) → MuJoCo wxyz quaternion.
 
-    The position axes remap as (-X, Z, Y) which is a proper rotation.
-    We rotate the WebXR orientation into the MuJoCo basis via
-    q_m = q_map ⊗ q_web ⊗ q_map^{-1}.
+    Rotates via q_m = q_map ⊗ q_web ⊗ q_map⁻¹.
     """
     q_web = np.array(
         [ori_dict["w"], ori_dict["x"], ori_dict["y"], ori_dict["z"]],
@@ -186,6 +179,27 @@ def _qinv(q):
     return np.array([q[0], -q[1], -q[2], -q[3]])
 
 
+def _xmat_to_wxyz(xmat):
+    """Convert a 3x3 rotation matrix (flattened 9-vec from MuJoCo) to wxyz quaternion."""
+    mat = np.array(xmat, dtype=float).reshape(3, 3)
+    from scipy.spatial.transform import Rotation
+    r = Rotation.from_matrix(mat)
+    xyzw = r.as_quat()
+    return np.array([xyzw[3], xyzw[0], xyzw[1], xyzw[2]])
+
+
+def _get_pos(hand_joints, name):
+    kp = hand_joints.get(name)
+    if kp and "position" in kp:
+        return webxr_to_mujoco(kp["position"])
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Pure-function helpers (no state dependency)
+# ---------------------------------------------------------------------------
+
+
 def fetch_hands():
     try:
         r = requests.get(HAND_TRACKER_URL, timeout=0.1)
@@ -196,15 +210,6 @@ def fetch_hands():
     except (requests.RequestException, ValueError):
         pass
     return None
-
-
-def _xmat_to_wxyz(xmat):
-    """Convert a 3x3 rotation matrix (flattened 9-vec from MuJoCo) to wxyz quaternion."""
-    mat = np.array(xmat, dtype=float).reshape(3, 3)
-    from scipy.spatial.transform import Rotation
-    r = Rotation.from_matrix(mat)
-    xyzw = r.as_quat()
-    return np.array([xyzw[3], xyzw[0], xyzw[1], xyzw[2]])
 
 
 def read_canonical_positions(model, data):
@@ -257,13 +262,7 @@ def get_offset_wrist(hand_data, side, offsets):
 
 
 def get_offset_wrist_pose(hand_data, side, offsets):
-    """Offset-corrected wrist pose [x, y, z, w, qx, qy, qz] in world frame, or None.
-
-    Position: same as get_offset_wrist.
-    Orientation: q_delta * q_cal_robot, where q_delta = q_cur * q_cal^{-1}.
-    When the user's hand hasn't rotated, the target orientation equals the
-    canonical robot wrist orientation, ensuring zero IK error at rest.
-    """
+    """Offset-corrected wrist pose [x, y, z, w, qx, qy, qz] in world frame, or None."""
     pos = get_offset_wrist(hand_data, side, offsets)
     if pos is None:
         return None
@@ -301,22 +300,8 @@ def build_finger_index_map(model):
     return result
 
 
-def _get_pos(hand_joints, name):
-    kp = hand_joints.get(name)
-    if kp and "position" in kp:
-        return webxr_to_mujoco(kp["position"])
-    return None
-
-
 def _build_palm_frame(hand_joints):
-    """Build an orthonormal palm frame (forward, lateral, normal) from keypoints.
-
-    forward  = wrist → middle-finger-metacarpal  (along fingers)
-    lateral  = index-metacarpal → pinky-metacarpal (orthogonalised)
-    normal   = cross(forward, lateral)             (out of palm)
-
-    Returns (forward, lateral, normal) unit vectors, or None.
-    """
+    """Build an orthonormal palm frame (forward, lateral, normal) from keypoints."""
     wrist_pos = _get_pos(hand_joints, "wrist")
     mid_meta = _get_pos(hand_joints, "middle-finger-metacarpal")
     idx_meta = _get_pos(hand_joints, "index-finger-metacarpal")
@@ -343,10 +328,7 @@ def _build_palm_frame(hand_joints):
 
 
 def calibrate_abduction_rest(hand_data):
-    """Record per-finger lateral angles at calibration (rest) pose.
-
-    Returns {(side, finger_name): rest_angle}.
-    """
+    """Record per-finger lateral angles at calibration (rest) pose."""
     rest = {}
     for side in ("left", "right"):
         joints = hand_data.get(side)
@@ -375,13 +357,7 @@ def calibrate_abduction_rest(hand_data):
 
 
 def _compute_abduction(hand_joints, side, finger_map, result, abd_rest):
-    """Compute abduction from lateral deviation of proximal phalanx.
-
-    For each finger, projects the proximal bone onto the palm plane and
-    measures its lateral angle.  The abduction is the change from the
-    calibration-time rest angle, which naturally handles the default
-    finger splay.
-    """
+    """Compute abduction from lateral deviation of proximal phalanx."""
     frame = _build_palm_frame(hand_joints)
     if frame is None:
         return
@@ -482,7 +458,7 @@ def sync_mocap_to_sites(model, data):
 
 
 def draw_webxr_keypoints(viewer, hand_data, offsets=None):
-    """Render WebXR keypoints: raw positions as blue dots, offset-corrected as red dots."""
+    """Render WebXR keypoints as colored spheres in the viewer."""
     viewer.user_scn.ngeom = 0
     if not hand_data:
         return
@@ -521,71 +497,151 @@ def draw_webxr_keypoints(viewer, hand_data, offsets=None):
 
 
 # ---------------------------------------------------------------------------
-# Main
+# TeleopTracker
 # ---------------------------------------------------------------------------
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--mjcf-path", type=str, default=None)
-    parser.add_argument("--reanchor", action="store_true", default=True,
-                        help="Re-anchor wrist offset on large IK jumps instead of freezing")
-    parser.add_argument(
-        "--raw-ik",
-        action="store_true",
-        default=False,
-        help="Disable smoothing/interpolation and run plain per-frame IK",
-    )
-    parser.add_argument(
-        "--no-stream-frames",
-        action="store_true",
-        default=False,
-        help="Disable streaming MuJoCo frames to the WebXR server",
-    )
-    parser.add_argument(
-        "--log-npy-path",
-        type=str,
-        default="hand_teleop_log.npz",
-        help="Path to save hand/end-effector log (npz, pickled objects)",
-    )
-    args = parser.parse_args()
+class TeleopTracker:
+    """Encapsulates the full WebXR → MuJoCo IK teleop loop.
 
-    mjcf_path = Path(args.mjcf_path) if args.mjcf_path else DEFAULT_MJCF
-    if not mjcf_path.exists():
-        print(f"Error: {mjcf_path} not found")
-        return
+    Manages model loading, IK processing, finger retargeting, frame streaming,
+    and the warmup/calibration/tracking state machine.
+    """
 
-    model = mujoco.MjModel.from_xml_path(str(mjcf_path))
-    data = mujoco.MjData(model)
-    mujoco.mj_resetDataKeyframe(model, data, 0)
-    mujoco.mj_forward(model, data)
+    def __init__(
+        self,
+        mjcf_path=None,
+        reanchor=True,
+        raw_ik=False,
+        stream_frames=True,
+        log_npy_path="hand_teleop_log.npz",
+    ):
+        self.mjcf_path = Path(mjcf_path) if mjcf_path else DEFAULT_MJCF
+        self.reanchor_enabled = reanchor
+        self.stream_frames = stream_frames
+        self.log_npy_path = log_npy_path
+        self.dt = 1.0 / CONTROL_HZ
 
-    free_nq = 0
-    free_nv = 0
-    for j in range(model.njnt):
-        if model.jnt_type[j] == mujoco.mjtJoint.mjJNT_FREE:
-            free_nq += 7
-            free_nv += 6
+        if not self.mjcf_path.exists():
+            raise FileNotFoundError(f"{self.mjcf_path} not found")
 
-    # Offscreen renderer for streaming to VR headset
-    offscreen = mujoco.Renderer(model, height=OFFSCREEN_HEIGHT, width=OFFSCREEN_WIDTH)
-    offscreen_cam = mujoco.MjvCamera()
-    offscreen_cam.type = mujoco.mjtCamera.mjCAMERA_FREE
-    offscreen_cam.distance = 2.0
-    offscreen_cam.azimuth = 270
-    offscreen_cam.elevation = -30
-    offscreen_cam.lookat[:] = [-0, 0, 1]
-    last_frame_post = [0.0]
-    stream_frames = [not args.no_stream_frames]
+        # MuJoCo model & data
+        self.model = mujoco.MjModel.from_xml_path(str(self.mjcf_path))
+        self.data = mujoco.MjData(self.model)
+        mujoco.mj_resetDataKeyframe(self.model, self.data, 0)
+        mujoco.mj_forward(self.model, self.data)
 
-    def maybe_post_frame(t):
-        if not stream_frames[0]:
+        self.free_nq = 0
+        self.free_nv = 0
+        for j in range(self.model.njnt):
+            if self.model.jnt_type[j] == mujoco.mjtJoint.mjJNT_FREE:
+                self.free_nq += 7
+                self.free_nv += 6
+
+        # Offscreen renderer for VR headset streaming
+        self._offscreen = mujoco.Renderer(
+            self.model, height=OFFSCREEN_HEIGHT, width=OFFSCREEN_WIDTH,
+        )
+        self._offscreen_cam = mujoco.MjvCamera()
+        self._offscreen_cam.type = mujoco.mjtCamera.mjCAMERA_FREE
+        self._offscreen_cam.distance = 2.0
+        self._offscreen_cam.azimuth = 270
+        self._offscreen_cam.elevation = -30
+        self._offscreen_cam.lookat[:] = [0, 0, 1]
+        self._last_frame_post = 0.0
+
+        # Canonical (home) FK positions
+        self.canonical = read_canonical_positions(self.model, self.data)
+
+        # IK processor
+        if raw_ik:
+            self.proc = PandaArmTrajectoryProcessor(
+                scene_path=self.mjcf_path,
+                control_hz=CONTROL_HZ,
+                min_point_distance=0.0,
+                max_point_distance=1e9,
+                interpolation_points=0,
+                smoothing_alpha=1.0,
+                smoothing_sigma=0.0,
+                ori_weight=5.0,
+            )
+        else:
+            self.proc = PandaArmTrajectoryProcessor(
+                scene_path=self.mjcf_path, control_hz=CONTROL_HZ, ori_weight=5.0,
+            )
+
+        self.arm_idx = {
+            s: self.proc.get_mujoco_qpos_indices(s)
+            for s in ("left", "right")
+        }
+        self.canonical_q = {
+            s: self.data.qpos[self.arm_idx[s]].copy()
+            for s in ("left", "right")
+        }
+
+        self.proc.register_callback(self._on_ik)
+
+        # Finger retargeting
+        self.finger_map = build_finger_index_map(self.model)
+
+        # Tracking state (reset in start/stop)
+        self.active = False
+        self._t_start = 0.0
+        self.offsets = {}
+        self._warmup_done = False
+        self._warmup_data = None
+        self._latest_raw_hand_data = None
+        self._last_fetch = 0.0
+        self._ik_q = {"left": None, "right": None}
+        self._prev_ik_q = {"left": None, "right": None}
+        self._finger_qpos = {"left": {}, "right": {}}
+        self._abd_rest = {}
+        self._reanchor = {"left": False, "right": False}
+        self._latest_webxr_wrist = {"left": None, "right": None}
+        self._ik_diag = {"left": {}, "right": {}}
+        self._log_samples = []
+
+        # Thread-safety for non-blocking mode
+        self._qpos_lock = threading.Lock()
+        self._latest_qpos = self.data.qpos[self.free_nq:].copy()
+        self._thread = None
+        self._stop_event = threading.Event()
+
+    # -- IK callback -------------------------------------------------------
+
+    def _on_ik(self, side, q, _t):
+        prev = self._prev_ik_q[side]
+        if prev is not None:
+            max_delta = float(np.max(np.abs(q - prev)))
+            rejected = max_delta > MAX_JOINT_DELTA
+            self._ik_diag[side] = {
+                "q_smoothed": q.copy(),
+                "max_delta": max_delta,
+                "rejected": rejected,
+            }
+            if rejected:
+                if self.reanchor_enabled:
+                    self._reanchor[side] = True
+                return
+        else:
+            self._ik_diag[side] = {
+                "q_smoothed": q.copy(),
+                "max_delta": 0.0,
+                "rejected": False,
+            }
+        self._ik_q[side] = q.copy()
+        self._prev_ik_q[side] = q.copy()
+
+    # -- Frame streaming ---------------------------------------------------
+
+    def _maybe_post_frame(self, t):
+        if not self.stream_frames:
             return
-        if t - last_frame_post[0] < 1.0 / FRAME_POST_HZ:
+        if t - self._last_frame_post < 1.0 / FRAME_POST_HZ:
             return
         try:
-            offscreen.update_scene(data, camera=offscreen_cam)
-            pixels = offscreen.render()
+            self._offscreen.update_scene(self.data, camera=self._offscreen_cam)
+            pixels = self._offscreen.render()
             buf = io.BytesIO()
             Image.fromarray(pixels).save(buf, format="JPEG", quality=70)
             requests.post(
@@ -596,283 +652,361 @@ def main():
             )
         except Exception:
             pass
-        last_frame_post[0] = t
+        self._last_frame_post = t
 
-    canonical = read_canonical_positions(model, data)
-    for side in ("left", "right"):
-        for jn, pos in canonical[side].items():
-            print(f"  canonical {side} {jn}: {pos}")
+    # -- Public API --------------------------------------------------------
 
-    # IK processor
-    if args.raw_ik:
-        proc = PandaArmTrajectoryProcessor(
-            scene_path=mjcf_path,
-            control_hz=CONTROL_HZ,
-            min_point_distance=0.0,
-            max_point_distance=1e9,
-            interpolation_points=0,
-            smoothing_alpha=1.0,
-            smoothing_sigma=0.0,
-            ori_weight=5.0,
-        )
-    else:
-        proc = PandaArmTrajectoryProcessor(
-            scene_path=mjcf_path, control_hz=CONTROL_HZ, ori_weight=5.0,
-        )
-    arm_idx = {s: proc.get_mujoco_qpos_indices(s) for s in ("left", "right")}
-    canonical_q = {s: data.qpos[arm_idx[s]].copy() for s in ("left", "right")}
-    ik_q = {"left": None, "right": None}
-    prev_ik_q = {"left": None, "right": None}
+    def get_qpos(self, order='mujoco'):
+        """Return the current robot joint positions (excluding free joints).
 
-    # Finger retargeting
-    finger_map = build_finger_index_map(model)
-    finger_qpos = {"left": {}, "right": {}}
-    abd_rest = [{}]
+        This is the primary output for downstream controllers: a 1-D numpy
+        array of all non-free-body joint angles in the MuJoCo model.
+        Thread-safe — can be called from any thread while the loop is running.
+        """
+        with self._qpos_lock:
+            qpos = self._latest_qpos.copy()
 
-    reanchor = {"left": False, "right": False}
-    latest_webxr_wrist = {"left": None, "right": None}
+        if order == 'mujoco':
+            return qpos
 
-    ik_diag = {"left": {}, "right": {}}
+        left_robot_qpos = qpos[:27]
+        right_robot_qpos = qpos[27:]
 
-    def on_ik(side, q, _t):
-        prev = prev_ik_q[side]
-        if prev is not None:
-            max_delta = float(np.max(np.abs(q - prev)))
-            rejected = max_delta > MAX_JOINT_DELTA
-            ik_diag[side] = {
-                "q_smoothed": q.copy(),
-                "max_delta": max_delta,
-                "rejected": rejected,
+        if order == "genesis":
+            assert left_robot_qpos.shape == (27, )
+            assert right_robot_qpos.shape == (27, )
+            MUJOCO_TO_GENESIS_ORDER = np.array([
+                0, 1, 2, 3, 4, 5, 6,
+                7, 11, 15, 19, 23,
+                8, 12, 16, 20, 24,
+                9, 13, 17, 21, 25,
+                10, 14, 18, 22, 26,
+            ])
+            left_robot_qpos = left_robot_qpos[MUJOCO_TO_GENESIS_ORDER]
+            right_robot_qpos = right_robot_qpos[MUJOCO_TO_GENESIS_ORDER]
+
+            return np.concatenate([left_robot_qpos, right_robot_qpos], axis=0)
+        
+    def start(self):
+        """Begin a new tracking session (warmup phase starts immediately)."""
+        self.active = True
+        self._t_start = time.time()
+        self.offsets = {}
+        self._warmup_done = False
+        self._warmup_data = None
+        self.proc.start_trajectory()
+        self._ik_q = {"left": None, "right": None}
+        self._prev_ik_q = {
+            "left": self.canonical_q["left"].copy(),
+            "right": self.canonical_q["right"].copy(),
+        }
+        self._finger_qpos = {"left": {}, "right": {}}
+        self._abd_rest = {}
+        self._reanchor = {"left": False, "right": False}
+        self._latest_webxr_wrist = {"left": None, "right": None}
+        self._log_samples.clear()
+        print(f"Warmup {WARMUP_SECONDS}s — hold hands steady...")
+
+    def stop(self):
+        """End the current tracking session and optionally save logs."""
+        self.active = False
+        self.proc.clear_trajectory()
+        self._ik_q = {"left": None, "right": None}
+        self._prev_ik_q = {"left": None, "right": None}
+        self._finger_qpos = {"left": {}, "right": {}}
+        self._abd_rest = {}
+        self._reanchor = {"left": False, "right": False}
+        self._latest_webxr_wrist = {"left": None, "right": None}
+        print("Stopped.")
+        if self._log_samples:
+            np.savez_compressed(
+                self.log_npy_path,
+                samples=np.array(self._log_samples, dtype=object),
+            )
+            print(f"Saved log: {self.log_npy_path} ({len(self._log_samples)} samples)")
+
+    # -- Per-frame tick phases ---------------------------------------------
+
+    def _tick_idle(self, now):
+        mujoco.mj_resetDataKeyframe(self.model, self.data, 0)
+        mujoco.mj_forward(self.model, self.data)
+        sync_mocap_to_sites(self.model, self.data)
+        self._maybe_post_frame(now)
+
+    def _tick_warmup(self, now):
+        hd = fetch_hands()
+        if hd:
+            self._warmup_data = hd
+            self._latest_raw_hand_data = hd
+        mujoco.mj_resetDataKeyframe(self.model, self.data, 0)
+        mujoco.mj_forward(self.model, self.data)
+        sync_mocap_to_sites(self.model, self.data)
+        self._maybe_post_frame(now)
+
+    def _finalize_warmup(self):
+        self._warmup_done = True
+        hd = self._warmup_data or fetch_hands()
+        if hd:
+            self.offsets = compute_offsets(hd, self.canonical)
+            for side, so in self.offsets.items():
+                w = so.get("wrist")
+                if w is not None:
+                    print(f"  {side} wrist offset: {w}")
+            for side in ("left", "right"):
+                wrist_target = get_offset_wrist(hd, side, self.offsets)
+                canon_w = self.canonical.get(side, {}).get("wrist")
+                if wrist_target is not None and canon_w is not None:
+                    err = np.linalg.norm(wrist_target - canon_w)
+                    print(f"  {side} calibration verify: target_err={err:.4f}")
+            self._abd_rest = calibrate_abduction_rest(hd)
+            print(f"  abduction rest angles: {self._abd_rest}")
+        print("Tracking active!")
+
+    def _tick_tracking(self, now):
+        if now - self._last_fetch >= self.dt:
+            hand_data = fetch_hands()
+            if hand_data:
+                self._latest_raw_hand_data = hand_data
+            if hand_data and self.offsets:
+                for side in ("left", "right"):
+                    joints = hand_data.get(side)
+                    if joints:
+                        w = joints.get("wrist")
+                        if w and "position" in w:
+                            self._latest_webxr_wrist[side] = w["position"]
+
+                    if (self._reanchor[side]
+                            and self._latest_webxr_wrist[side] is not None
+                            and side in self.offsets):
+                        site_name = ROBOT_SITES[side]["wrist"]
+                        robot_pos = self.data.site_xpos[
+                            self.model.site(site_name).id
+                        ].copy()
+                        new_off = robot_pos - webxr_to_mujoco(
+                            self._latest_webxr_wrist[side]
+                        )
+                        self.offsets[side]["wrist"] = new_off
+                        self._prev_ik_q[side] = self.data.qpos[self.arm_idx[side]].copy()
+                        self._reanchor[side] = False
+
+                    wrist_pose = get_offset_wrist_pose(hand_data, side, self.offsets)
+                    if wrist_pose is not None:
+                        self.proc.add_point(wrist_pose, side)
+                    if joints:
+                        self._finger_qpos[side] = retarget_fingers(
+                            joints, side, self.finger_map, self._abd_rest,
+                        )
+            self._last_fetch = now
+
+        # Apply IK + finger results to qpos
+        for side in ("left", "right"):
+            q = self._ik_q[side]
+            if q is not None:
+                self.data.qpos[self.arm_idx[side]] = q
+            for qidx, angle in self._finger_qpos[side].items():
+                self.data.qpos[qidx] = angle
+
+        robot_qpos = self.data.qpos[self.free_nq:].copy()
+        mujoco.mj_step(self.model, self.data)
+        self.data.qpos[self.free_nq:] = robot_qpos
+        self.data.qvel[self.free_nv:] = 0
+        mujoco.mj_forward(self.model, self.data)
+        sync_mocap_to_sites(self.model, self.data)
+        self._maybe_post_frame(now)
+
+        self._record_log_sample(now)
+
+    def _record_log_sample(self, now):
+        if not self._latest_raw_hand_data:
+            return
+        robot_sites = {}
+        for side in ("left", "right"):
+            robot_sites[side] = {}
+            for jname, site_name in ROBOT_SITES[side].items():
+                sid = self.model.site(site_name).id
+                robot_sites[side][jname] = self.data.site_xpos[sid].copy()
+
+        offsets_copy = {
+            s: {k: (v.copy() if hasattr(v, 'copy') else v) for k, v in d.items()}
+            for s, d in self.offsets.items()
+        } if self.offsets else {}
+
+        ik_diag_copy = {}
+        for side in ("left", "right"):
+            d = self._ik_diag.get(side, {})
+            ik_diag_copy[side] = {
+                k: (v.copy() if hasattr(v, 'copy') else v) for k, v in d.items()
             }
-            if rejected:
-                if args.reanchor:
-                    reanchor[side] = True
-                return
-        else:
-            ik_diag[side] = {
-                "q_smoothed": q.copy(),
-                "max_delta": 0.0,
-                "rejected": False,
-            }
-        ik_q[side] = q.copy()
-        prev_ik_q[side] = q.copy()
 
-    proc.register_callback(on_ik)
+        ik_target_world = {}
+        for side in ("left", "right"):
+            raw = self._latest_raw_hand_data.get(side, {})
+            raw_wrist = raw.get("wrist", {})
+            off = self.offsets.get(side, {}).get("wrist")
+            if "position" in raw_wrist and off is not None:
+                pos_mj = webxr_to_mujoco(raw_wrist["position"])
+                ik_target_world[side] = (pos_mj + off).copy()
+            else:
+                ik_target_world[side] = None
 
-    # State -----------------------------------------------------------------
-    active = [False]
-    t_start = [0.0]
-    offsets = [{}]
-    warmup_done = [False]
-    warmup_data = [None]
-    latest_raw_hand_data = [None]
-    last_fetch = [0.0]
-    dt = 1.0 / CONTROL_HZ
-    log_samples = []
+        ik_target_base = {}
+        ik_raw_q = {}
+        for side in ("left", "right"):
+            tb = self.proc.last_ik_target_base.get(side)
+            ik_target_base[side] = tb.copy() if tb is not None else None
+            rq = self.proc.last_ik_raw.get(side)
+            ik_raw_q[side] = rq.copy() if rq is not None else None
 
-    def on_key(key):
+        self._log_samples.append({
+            "time": now,
+            "webxr_raw": self._latest_raw_hand_data,
+            "robot_sites": robot_sites,
+            "robot_qpos": self.data.qpos.copy(),
+            "offsets": offsets_copy,
+            "ik_diag": ik_diag_copy,
+            "ik_target_world": ik_target_world,
+            "ik_target_base": ik_target_base,
+            "ik_raw_q": ik_raw_q,
+            "canonical_q": {s: self.canonical_q[s].copy() for s in ("left", "right")},
+            "arm_qpos": {s: self.data.qpos[self.arm_idx[s]].copy() for s in ("left", "right")},
+        })
+
+    # -- Viewer key callback -----------------------------------------------
+
+    def _on_key(self, key):
         if key == ord("f"):
-            stream_frames[0] = not stream_frames[0]
-            state = "enabled" if stream_frames[0] else "disabled"
+            self.stream_frames = not self.stream_frames
+            state = "enabled" if self.stream_frames else "disabled"
             print(f"Frame streaming {state}.")
             return
         if key != 32:
             return
-        if not active[0]:
-            active[0] = True
-            t_start[0] = time.time()
-            offsets[0] = {}
-            warmup_done[0] = False
-            warmup_data[0] = None
-            proc.start_trajectory()
-            ik_q["left"] = ik_q["right"] = None
-            prev_ik_q["left"] = canonical_q["left"].copy()
-            prev_ik_q["right"] = canonical_q["right"].copy()
-            finger_qpos["left"] = finger_qpos["right"] = {}
-            abd_rest[0] = {}
-            reanchor["left"] = reanchor["right"] = False
-            latest_webxr_wrist["left"] = latest_webxr_wrist["right"] = None
-            log_samples.clear()
-            print(f"Warmup {WARMUP_SECONDS}s — hold hands steady...")
+        if not self.active:
+            self.start()
         else:
-            active[0] = False
-            proc.clear_trajectory()
-            ik_q["left"] = ik_q["right"] = None
-            prev_ik_q["left"] = prev_ik_q["right"] = None
-            finger_qpos["left"] = finger_qpos["right"] = {}
-            abd_rest[0] = {}
-            reanchor["left"] = reanchor["right"] = False
-            latest_webxr_wrist["left"] = latest_webxr_wrist["right"] = None
-            print("Stopped.")
-            if log_samples:
-                np.savez_compressed(
-                    args.log_npy_path,
-                    samples=np.array(log_samples, dtype=object),
-                )
-                print(f"Saved log: {args.log_npy_path} ({len(log_samples)} samples)")
+            self.stop()
 
-    if fetch_hands() is None:
-        print("Warning: hand tracker not reachable.")
-    else:
-        print("Hand tracker connected.")
-    print("\nSPACE = start/stop  |  F = toggle streaming  |  ESC = quit\n")
+    # -- Step & run --------------------------------------------------------
 
-    with mujoco.viewer.launch_passive(model, data, key_callback=on_key) as v:
-        while v.is_running():
-            now = time.time()
+    def step(self, viewer=None):
+        """Execute one tick of the teleop loop. Returns the current robot qpos.
 
-            # ------ idle ---------------------------------------------------
-            if not active[0]:
-                mujoco.mj_resetDataKeyframe(model, data, 0)
-                mujoco.mj_forward(model, data)
-                sync_mocap_to_sites(model, data)
-                maybe_post_frame(now)
-                draw_webxr_keypoints(v, latest_raw_hand_data[0], offsets[0])
-                v.sync()
-                time.sleep(0.001)
-                continue
+        If *viewer* is provided, also renders keypoints and syncs the viewer.
+        """
+        now = time.time()
 
-            elapsed = now - t_start[0]
-
-            # ------ warmup -------------------------------------------------
+        if not self.active:
+            self._tick_idle(now)
+        elif not self._warmup_done:
+            elapsed = now - self._t_start
             if elapsed < WARMUP_SECONDS:
-                hd = fetch_hands()
-                if hd:
-                    warmup_data[0] = hd
-                    latest_raw_hand_data[0] = hd
-                mujoco.mj_resetDataKeyframe(model, data, 0)
-                mujoco.mj_forward(model, data)
-                sync_mocap_to_sites(model, data)
-                maybe_post_frame(now)
-                draw_webxr_keypoints(v, latest_raw_hand_data[0], offsets[0])
-                v.sync()
+                self._tick_warmup(now)
+            else:
+                self._finalize_warmup()
+                self._tick_tracking(now)
+        else:
+            self._tick_tracking(now)
+
+        with self._qpos_lock:
+            self._latest_qpos = self.data.qpos[self.free_nq:].copy()
+
+        if viewer is not None:
+            draw_webxr_keypoints(viewer, self._latest_raw_hand_data, self.offsets)
+            viewer.sync()
+
+        return self.get_qpos()
+
+    def _run_loop(self):
+        """Internal loop body — launched directly or on a background thread."""
+        for side in ("left", "right"):
+            for jn, pos in self.canonical[side].items():
+                print(f"  canonical {side} {jn}: {pos}")
+
+        if fetch_hands() is None:
+            print("Warning: hand tracker not reachable.")
+        else:
+            print("Hand tracker connected.")
+        print("\nSPACE = start/stop  |  F = toggle streaming  |  ESC = quit\n")
+
+        with mujoco.viewer.launch_passive(
+            self.model, self.data, key_callback=self._on_key,
+        ) as v:
+            while v.is_running() and not self._stop_event.is_set():
+                self.step(viewer=v)
                 time.sleep(0.001)
-                continue
 
-            # ------ warmup → tracking transition --------------------------
-            if not warmup_done[0]:
-                warmup_done[0] = True
-                hd = warmup_data[0] or fetch_hands()
-                if hd:
-                    offsets[0] = compute_offsets(hd, canonical)
-                    for side, so in offsets[0].items():
-                        w = so.get("wrist")
-                        if w is not None:
-                            print(f"  {side} wrist offset: {w}")
-                    for side in ("left", "right"):
-                        wrist_target = get_offset_wrist(hd, side, offsets[0])
-                        canon_w = canonical.get(side, {}).get("wrist")
-                        if wrist_target is not None and canon_w is not None:
-                            err = np.linalg.norm(wrist_target - canon_w)
-                            print(f"  {side} calibration verify: target_err={err:.4f}")
-                    abd_rest[0] = calibrate_abduction_rest(hd)
-                    print(f"  abduction rest angles: {abd_rest[0]}")
-                print("Tracking active!")
+    def run(self, blocking=True):
+        """Launch the passive MuJoCo viewer and run the teleop loop.
 
-            # ------ tracking -----------------------------------------------
-            if now - last_fetch[0] >= dt:
-                hand_data = fetch_hands()
-                if hand_data:
-                    latest_raw_hand_data[0] = hand_data
-                if hand_data and offsets[0]:
-                    for side in ("left", "right"):
-                        joints = hand_data.get(side)
-                        if joints:
-                            w = joints.get("wrist")
-                            if w and "position" in w:
-                                latest_webxr_wrist[side] = w["position"]
+        Parameters
+        ----------
+        blocking : bool
+            If True (default), blocks the calling thread until the viewer
+            is closed.  If False, the loop runs on a daemon background
+            thread so the caller can continue — e.g. to poll ``get_qpos()``
+            from the main thread.
+        """
+        self._stop_event.clear()
+        if blocking:
+            self._run_loop()
+        else:
+            self._thread = threading.Thread(
+                target=self._run_loop, daemon=True, name="TeleopTracker",
+            )
+            self._thread.start()
 
-                        if (reanchor[side]
-                                and latest_webxr_wrist[side] is not None
-                                and side in offsets[0]):
-                            site_name = ROBOT_SITES[side]["wrist"]
-                            robot_pos = data.site_xpos[
-                                model.site(site_name).id
-                            ].copy()
-                            new_off = robot_pos - webxr_to_mujoco(
-                                latest_webxr_wrist[side]
-                            )
-                            offsets[0][side]["wrist"] = new_off
-                            prev_ik_q[side] = data.qpos[arm_idx[side]].copy()
-                            reanchor[side] = False
+    @property
+    def is_running(self):
+        """True while the background loop thread is alive."""
+        return self._thread is not None and self._thread.is_alive()
 
-                        wrist_pose = get_offset_wrist_pose(hand_data, side, offsets[0])
-                        if wrist_pose is not None:
-                            proc.add_point(wrist_pose, side)
-                        if joints:
-                            finger_qpos[side] = retarget_fingers(
-                                joints, side, finger_map, abd_rest[0]
-                            )
-                last_fetch[0] = now
+    def shutdown(self, timeout=5.0):
+        """Signal the background loop to stop and wait for it to finish.
 
-            for side in ("left", "right"):
-                q = ik_q[side]
-                if q is not None:
-                    data.qpos[arm_idx[side]] = q
-                for qidx, angle in finger_qpos[side].items():
-                    data.qpos[qidx] = angle
+        Safe to call even if ``run()`` was called with ``blocking=True``
+        or has already exited.
+        """
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=timeout)
+            self._thread = None
 
-            robot_qpos = data.qpos[free_nq:].copy()
-            mujoco.mj_step(model, data)
-            data.qpos[free_nq:] = robot_qpos
-            data.qvel[free_nv:] = 0
-            mujoco.mj_forward(model, data)
-            sync_mocap_to_sites(model, data)
-            maybe_post_frame(now)
-            draw_webxr_keypoints(v, latest_raw_hand_data[0], offsets[0])
 
-            if latest_raw_hand_data[0]:
-                robot_sites = {}
-                for side in ("left", "right"):
-                    robot_sites[side] = {}
-                    for jname, site_name in ROBOT_SITES[side].items():
-                        sid = model.site(site_name).id
-                        robot_sites[side][jname] = data.site_xpos[sid].copy()
-                offsets_copy = {
-                    s: {k: (v.copy() if hasattr(v, 'copy') else v)
-                        for k, v in d.items()}
-                    for s, d in offsets[0].items()
-                } if offsets[0] else {}
-                ik_diag_copy = {}
-                for side in ("left", "right"):
-                    d = ik_diag.get(side, {})
-                    ik_diag_copy[side] = {
-                        k: (v.copy() if hasattr(v, 'copy') else v)
-                        for k, v in d.items()
-                    }
-                ik_target_world = {}
-                for side in ("left", "right"):
-                    raw = latest_raw_hand_data[0].get(side, {})
-                    raw_wrist = raw.get("wrist", {})
-                    off = offsets[0].get(side, {}).get("wrist")
-                    if "position" in raw_wrist and off is not None:
-                        pos_mj = webxr_to_mujoco(raw_wrist["position"])
-                        ik_target_world[side] = (pos_mj + off).copy()
-                    else:
-                        ik_target_world[side] = None
-                ik_target_base = {}
-                ik_raw_q = {}
-                for side in ("left", "right"):
-                    tb = proc.last_ik_target_base.get(side)
-                    ik_target_base[side] = tb.copy() if tb is not None else None
-                    rq = proc.last_ik_raw.get(side)
-                    ik_raw_q[side] = rq.copy() if rq is not None else None
-                log_samples.append({
-                    "time": now,
-                    "webxr_raw": latest_raw_hand_data[0],
-                    "robot_sites": robot_sites,
-                    "robot_qpos": data.qpos.copy(),
-                    "offsets": offsets_copy,
-                    "ik_diag": ik_diag_copy,
-                    "ik_target_world": ik_target_world,
-                    "ik_target_base": ik_target_base,
-                    "ik_raw_q": ik_raw_q,
-                    "canonical_q": {s: canonical_q[s].copy() for s in ("left", "right")},
-                    "arm_qpos": {s: data.qpos[arm_idx[s]].copy() for s in ("left", "right")},
-                })
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
 
-            v.sync()
-            time.sleep(0.001)
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mjcf-path", type=str, default=None)
+    parser.add_argument(
+        "--reanchor", action="store_true", default=True,
+        help="Re-anchor wrist offset on large IK jumps instead of freezing",
+    )
+    parser.add_argument(
+        "--raw-ik", action="store_true", default=False,
+        help="Disable smoothing/interpolation and run plain per-frame IK",
+    )
+    parser.add_argument(
+        "--no-stream-frames", action="store_true", default=False,
+        help="Disable streaming MuJoCo frames to the WebXR server",
+    )
+    parser.add_argument(
+        "--log-npy-path", type=str, default="hand_teleop_log.npz",
+        help="Path to save hand/end-effector log (npz, pickled objects)",
+    )
+    args = parser.parse_args()
+
+    tracker = TeleopTracker(
+        mjcf_path=args.mjcf_path,
+        reanchor=args.reanchor,
+        raw_ik=args.raw_ik,
+        stream_frames=not args.no_stream_frames,
+        log_npy_path=args.log_npy_path,
+    )
+    tracker.run(blocking=True)
+    tracker.shutdown()
 
 
 if __name__ == "__main__":
