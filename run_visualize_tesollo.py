@@ -28,7 +28,7 @@ def get_mjpython():
 
 mjpython = get_mjpython()
 if mjpython:
-    os.execv(mjpython, [mjpython, str(VISUALIZER), "--mjcf-path", str(MJCF.resolve())])
+    os.execv(mjpython, [mjpython, str(VISUALIZER), "--mjcf-path", str(MJCF.resolve()), "--no-stream-frames"])
 else:
     if sys.platform == "darwin":
         print("On macOS the viewer needs mjpython. Install and run:", file=sys.stderr)

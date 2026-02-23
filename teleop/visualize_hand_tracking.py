@@ -43,7 +43,7 @@ DEFAULT_MJCF = (
 )
 CONTROL_HZ = 60
 WARMUP_SECONDS = 2.5
-MAX_JOINT_DELTA = 0.5
+MAX_JOINT_DELTA = 1000
 
 JOINT_NAMES = [
     "wrist",
@@ -518,7 +518,7 @@ class TeleopTracker:
         stream_frames=True,
         log_npy_path="hand_teleop_log.npz",
         socket_host="127.0.0.1",
-        socket_port=9003,
+        socket_port=9004,
     ):
         self.mjcf_path = Path(mjcf_path) if mjcf_path else DEFAULT_MJCF
         self.reanchor_enabled = reanchor
@@ -609,7 +609,7 @@ class TeleopTracker:
 
         # Thread-safety for non-blocking mode
         self._qpos_lock = threading.Lock()
-        self._latest_qpos = self.data.qpos[:self.data.qpos.shape[0] - self.free_nq].copy()
+        self._latest_qpos = self.data.qpos[self.free_nq:].copy()
         self._thread = None
         self._stop_event = threading.Event()
 
@@ -1008,7 +1008,7 @@ class TeleopTracker:
             self._tick_tracking(now)
 
         with self._qpos_lock:
-            self._latest_qpos = self.data.qpos[:self.data.qpos.shape[0] - self.free_nq].copy()
+            self._latest_qpos = self.data.qpos[self.free_nq:].copy()
 
         if viewer is not None:
             draw_webxr_keypoints(viewer, self._latest_raw_hand_data, self.offsets)
@@ -1112,7 +1112,7 @@ def main():
         help="Host for the teleop socket server",
     )
     parser.add_argument(
-        "--socket-port", type=int, default=9003,
+        "--socket-port", type=int, default=9004,
         help="Port for the teleop socket server",
     )
     args = parser.parse_args()

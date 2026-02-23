@@ -9,7 +9,7 @@ import numpy as np
 class TeleopClient:
     """Client that connects to a TeleopTracker socket server for is_ready and get_qpos."""
 
-    def __init__(self, host="127.0.0.1", port=9003):
+    def __init__(self, host="127.0.0.1", port=9004):
         self.host = host
         self.port = port
 
