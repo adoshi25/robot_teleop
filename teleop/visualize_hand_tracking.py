@@ -13,6 +13,8 @@ Usage:
 
 import argparse
 import io
+import json
+import socket
 import sys
 import threading
 import time
@@ -515,11 +517,15 @@ class TeleopTracker:
         raw_ik=False,
         stream_frames=True,
         log_npy_path="hand_teleop_log.npz",
+        socket_host="127.0.0.1",
+        socket_port=9003,
     ):
         self.mjcf_path = Path(mjcf_path) if mjcf_path else DEFAULT_MJCF
         self.reanchor_enabled = reanchor
         self.stream_frames = stream_frames
         self.log_npy_path = log_npy_path
+        self.socket_host = socket_host
+        self.socket_port = socket_port
         self.dt = 1.0 / CONTROL_HZ
 
         if not self.mjcf_path.exists():
@@ -603,9 +609,14 @@ class TeleopTracker:
 
         # Thread-safety for non-blocking mode
         self._qpos_lock = threading.Lock()
-        self._latest_qpos = self.data.qpos[self.free_nq:].copy()
+        self._latest_qpos = self.data.qpos[:self.data.qpos.shape[0] - self.free_nq].copy()
         self._thread = None
         self._stop_event = threading.Event()
+
+        self._socket_server_sock = None
+        self._socket_server_thread = None
+
+        self.is_ready = False
 
     # -- IK callback -------------------------------------------------------
 
@@ -665,7 +676,7 @@ class TeleopTracker:
         """
         with self._qpos_lock:
             qpos = self._latest_qpos.copy()
-
+        
         if order == 'mujoco':
             return qpos
 
@@ -761,6 +772,7 @@ class TeleopTracker:
             self._abd_rest = calibrate_abduction_rest(hd)
             print(f"  abduction rest angles: {self._abd_rest}")
         print("Tracking active!")
+        self.is_ready = True
 
     def _tick_tracking(self, now):
         if now - self._last_fetch >= self.dt:
@@ -886,6 +898,94 @@ class TeleopTracker:
         else:
             self.stop()
 
+    # -- Socket server -----------------------------------------------------
+
+    def _handle_socket_request(self, conn, addr):
+        """Handle one request from a connected client. Protocol: one line per request."""
+        try:
+            data = conn.recv(4096).decode("utf-8").strip()
+            if not data:
+                return
+            parts = data.split(maxsplit=1)
+            cmd = parts[0].lower()
+            arg = parts[1] if len(parts) > 1 else None
+
+            if cmd == "is_ready":
+                resp = json.dumps({"ready": self.is_ready})
+            elif cmd == "get_qpos":
+                order = arg if arg in ("mujoco", "genesis") else "genesis"
+                # if not self.is_ready:
+                #     resp = json.dumps({"error": "not ready"})
+                # else:
+                qpos = self.get_qpos(order=order)
+                resp = json.dumps({"qpos": qpos.tolist()})
+            else:
+                resp = json.dumps({"error": f"unknown command: {cmd}"})
+            conn.sendall((resp + "\n").encode("utf-8"))
+        except Exception as e:
+            try:
+                conn.sendall(
+                    (json.dumps({"error": str(e)}) + "\n").encode("utf-8")
+                )
+            except Exception:
+                pass
+        finally:
+            conn.close()
+
+    def _run_socket_server(self):
+        """Run the TCP socket server in a loop. Accepts connections and handles requests."""
+        self._socket_server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._socket_server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            self._socket_server_sock.bind((self.socket_host, self.socket_port))
+        except OSError as e:
+            print(f"Socket server bind failed: {e}")
+            return
+        self._socket_server_sock.listen(5)
+        self._socket_server_sock.settimeout(0.5)
+        print(f"Teleop socket server listening on {self.socket_host}:{self.socket_port}")
+
+        while not self._stop_event.is_set():
+            try:
+                conn, addr = self._socket_server_sock.accept()
+                threading.Thread(
+                    target=self._handle_socket_request,
+                    args=(conn, addr),
+                    daemon=True,
+                ).start()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+        try:
+            self._socket_server_sock.close()
+        except Exception:
+            pass
+        self._socket_server_sock = None
+
+    def _start_socket_server(self):
+        """Start the socket server in a background thread."""
+        if self._socket_server_thread is not None:
+            return
+        self._socket_server_thread = threading.Thread(
+            target=self._run_socket_server,
+            daemon=True,
+            name="TeleopSocketServer",
+        )
+        self._socket_server_thread.start()
+
+    def _stop_socket_server(self):
+        """Stop the socket server."""
+        self._stop_event.set()
+        if self._socket_server_sock:
+            try:
+                self._socket_server_sock.close()
+            except Exception:
+                pass
+        if self._socket_server_thread is not None:
+            self._socket_server_thread.join(timeout=2.0)
+            self._socket_server_thread = None
+
     # -- Step & run --------------------------------------------------------
 
     def step(self, viewer=None):
@@ -908,7 +1008,7 @@ class TeleopTracker:
             self._tick_tracking(now)
 
         with self._qpos_lock:
-            self._latest_qpos = self.data.qpos[self.free_nq:].copy()
+            self._latest_qpos = self.data.qpos[:self.data.qpos.shape[0] - self.free_nq].copy()
 
         if viewer is not None:
             draw_webxr_keypoints(viewer, self._latest_raw_hand_data, self.offsets)
@@ -918,6 +1018,9 @@ class TeleopTracker:
 
     def _run_loop(self):
         """Internal loop body — launched directly or on a background thread."""
+        self._stop_event.clear()
+        self._start_socket_server()
+
         for side in ("left", "right"):
             for jn, pos in self.canonical[side].items():
                 print(f"  canonical {side} {jn}: {pos}")
@@ -967,6 +1070,14 @@ class TeleopTracker:
         or has already exited.
         """
         self._stop_event.set()
+        if self._socket_server_sock:
+            try:
+                self._socket_server_sock.close()
+            except Exception:
+                pass
+        if self._socket_server_thread is not None:
+            self._socket_server_thread.join(timeout=2.0)
+            self._socket_server_thread = None
         if self._thread is not None:
             self._thread.join(timeout=timeout)
             self._thread = None
@@ -996,6 +1107,14 @@ def main():
         "--log-npy-path", type=str, default="hand_teleop_log.npz",
         help="Path to save hand/end-effector log (npz, pickled objects)",
     )
+    parser.add_argument(
+        "--socket-host", type=str, default="127.0.0.1",
+        help="Host for the teleop socket server",
+    )
+    parser.add_argument(
+        "--socket-port", type=int, default=9003,
+        help="Port for the teleop socket server",
+    )
     args = parser.parse_args()
 
     tracker = TeleopTracker(
@@ -1004,6 +1123,8 @@ def main():
         raw_ik=args.raw_ik,
         stream_frames=not args.no_stream_frames,
         log_npy_path=args.log_npy_path,
+        socket_host=args.socket_host,
+        socket_port=args.socket_port,
     )
     tracker.run(blocking=True)
     tracker.shutdown()
