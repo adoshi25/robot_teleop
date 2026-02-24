@@ -516,6 +516,7 @@ class TeleopTracker:
         reanchor=True,
         raw_ik=False,
         stream_frames=True,
+        enable_collision_check=True,
         log_npy_path="hand_teleop_log.npz",
         socket_host="127.0.0.1",
         socket_port=9004,
@@ -523,6 +524,7 @@ class TeleopTracker:
         self.mjcf_path = Path(mjcf_path) if mjcf_path else DEFAULT_MJCF
         self.reanchor_enabled = reanchor
         self.stream_frames = stream_frames
+        self.collision_check_enabled = enable_collision_check
         self.log_npy_path = log_npy_path
         self.socket_host = socket_host
         self.socket_port = socket_port
@@ -590,6 +592,21 @@ class TeleopTracker:
         # Finger retargeting
         self.finger_map = build_finger_index_map(self.model)
 
+        # Collision checking (pre-compute once at init)
+        self._geom_is_left = np.zeros(self.model.ngeom, dtype=bool)
+        self._geom_is_right = np.zeros(self.model.ngeom, dtype=bool)
+        self._build_collision_geom_groups()
+
+        # Baseline: rest-pose contact body pairs are structural mesh overlaps
+        self._baseline_body_pairs: set[tuple[int, int]] = set()
+        for i in range(self.data.ncon):
+            c = self.data.contact[i]
+            if c.dist < 0:
+                b1 = int(self.model.geom_bodyid[int(c.geom[0])])
+                b2 = int(self.model.geom_bodyid[int(c.geom[1])])
+                self._baseline_body_pairs.add((min(b1, b2), max(b1, b2)))
+        print(f"Baseline contact pairs (rest pose): {len(self._baseline_body_pairs)}")
+
         # Tracking state (reset in start/stop)
         self.active = False
         self._t_start = 0.0
@@ -605,6 +622,11 @@ class TeleopTracker:
         self._reanchor = {"left": False, "right": False}
         self._latest_webxr_wrist = {"left": None, "right": None}
         self._ik_diag = {"left": {}, "right": {}}
+        self._collision_info = {
+            "left_self_collision": False, "right_self_collision": False,
+            "inter_collision": False, "n_contacts": 0, "rejected": False,
+        }
+        self._safe_robot_qpos = self.data.qpos[self.free_nq:].copy()
         self._log_samples = []
 
         # Thread-safety for non-blocking mode
@@ -617,6 +639,136 @@ class TeleopTracker:
         self._socket_server_thread = None
 
         self.is_ready = False
+
+    # -- Collision checking ------------------------------------------------
+
+    def _build_collision_geom_groups(self):
+        """Pre-compute boolean arrays mapping geom IDs to left/right robot.
+
+        Walks the body tree from each side's joints upward, removes shared
+        ancestor bodies, then collects all descendant bodies.  The result is
+        two boolean arrays (one per side) indexed by geom ID for O(1) lookup.
+        """
+        left_joint_bodies: set[int] = set()
+        right_joint_bodies: set[int] = set()
+
+        for side in ("left", "right"):
+            bset = left_joint_bodies if side == "left" else right_joint_bodies
+            qpos_set = set(int(qi) for qi in self.arm_idx[side])
+            for j in range(self.model.njnt):
+                if int(self.model.jnt_qposadr[j]) in qpos_set:
+                    bset.add(int(self.model.jnt_bodyid[j]))
+
+        for side, fingers in FINGER_JOINT_NAMES.items():
+            bset = left_joint_bodies if side == "left" else right_joint_bodies
+            for joint_names in fingers.values():
+                for jname in joint_names:
+                    jid = mujoco.mj_name2id(
+                        self.model, mujoco.mjtObj.mjOBJ_JOINT, jname,
+                    )
+                    if jid >= 0:
+                        bset.add(int(self.model.jnt_bodyid[jid]))
+
+        left_all: set[int] = set()
+        right_all: set[int] = set()
+        for bid in left_joint_bodies:
+            b = bid
+            while b > 0:
+                left_all.add(b)
+                b = int(self.model.body_parentid[b])
+        for bid in right_joint_bodies:
+            b = bid
+            while b > 0:
+                right_all.add(b)
+                b = int(self.model.body_parentid[b])
+
+        shared = left_all & right_all
+        left_bodies = left_all - shared
+        right_bodies = right_all - shared
+
+        # Add descendant bodies (MuJoCo guarantees parent ID < child ID)
+        for b in range(self.model.nbody):
+            if b in left_bodies or b in right_bodies:
+                continue
+            parent = int(self.model.body_parentid[b])
+            if parent in left_bodies:
+                left_bodies.add(b)
+            elif parent in right_bodies:
+                right_bodies.add(b)
+
+        ngeom = self.model.ngeom
+        self._geom_is_left = np.zeros(ngeom, dtype=bool)
+        self._geom_is_right = np.zeros(ngeom, dtype=bool)
+        for g in range(ngeom):
+            bid = int(self.model.geom_bodyid[g])
+            if bid in left_bodies:
+                self._geom_is_left[g] = True
+            if bid in right_bodies:
+                self._geom_is_right[g] = True
+
+        print(
+            f"Collision groups: {int(np.sum(self._geom_is_left))} left geoms, "
+            f"{int(np.sum(self._geom_is_right))} right geoms"
+        )
+
+    def _check_collisions(self):
+        """Classify contacts already computed on self.data by mj_forward.
+
+        These are the exact same contacts the MuJoCo viewer visualises
+        (toggle with backtick).  Contacts between body pairs that exist
+        at the rest pose are treated as structural mesh overlaps and
+        skipped.  When collision checking is disabled, this is a cheap
+        no-op.
+        """
+        if not self.collision_check_enabled:
+            return {
+                "left_self_collision": False, "right_self_collision": False,
+                "inter_collision": False, "n_contacts": 0, "rejected": False,
+            }
+
+        ncon = self.data.ncon
+        if ncon == 0:
+            return {
+                "left_self_collision": False, "right_self_collision": False,
+                "inter_collision": False, "n_contacts": 0, "rejected": False,
+            }
+
+        left_self = False
+        right_self = False
+        inter = False
+        n_pen = 0
+        geom_is_left = self._geom_is_left
+        geom_is_right = self._geom_is_right
+        geom_bodyid = self.model.geom_bodyid
+        baseline = self._baseline_body_pairs
+
+        for i in range(ncon):
+            c = self.data.contact[i]
+            if c.dist >= 0:
+                continue
+            g1, g2 = int(c.geom[0]), int(c.geom[1])
+            b1, b2 = int(geom_bodyid[g1]), int(geom_bodyid[g2])
+            if (min(b1, b2), max(b1, b2)) in baseline:
+                continue
+            n_pen += 1
+            g1l = geom_is_left[g1]
+            g1r = geom_is_right[g1]
+            g2l = geom_is_left[g2]
+            g2r = geom_is_right[g2]
+            left_self = left_self or (g1l and g2l)
+            right_self = right_self or (g1r and g2r)
+            inter = inter or ((g1l and g2r) or (g1r and g2l))
+            if left_self and right_self and inter:
+                break
+
+        rejected = left_self or right_self or inter
+        return {
+            "left_self_collision": left_self,
+            "right_self_collision": right_self,
+            "inter_collision": inter,
+            "n_contacts": n_pen,
+            "rejected": rejected,
+        }
 
     # -- IK callback -------------------------------------------------------
 
@@ -715,6 +867,11 @@ class TeleopTracker:
         self._abd_rest = {}
         self._reanchor = {"left": False, "right": False}
         self._latest_webxr_wrist = {"left": None, "right": None}
+        self._collision_info = {
+            "left_self_collision": False, "right_self_collision": False,
+            "inter_collision": False, "n_contacts": 0, "rejected": False,
+        }
+        self._safe_robot_qpos = self.data.qpos[self.free_nq:].copy()
         self._log_samples.clear()
         print(f"Warmup {WARMUP_SECONDS}s — hold hands steady...")
 
@@ -824,6 +981,20 @@ class TeleopTracker:
         self.data.qpos[self.free_nq:] = robot_qpos
         self.data.qvel[self.free_nv:] = 0
         mujoco.mj_forward(self.model, self.data)
+
+        # Collision check on the contacts mj_forward just computed
+        # (same contacts the viewer shows when pressing backtick)
+        self._collision_info = self._check_collisions()
+        if self._collision_info["rejected"]:
+            self.data.qpos[self.free_nq:] = self._safe_robot_qpos
+            for side in ("left", "right"):
+                self._prev_ik_q[side] = self.data.qpos[self.arm_idx[side]].copy()
+                for qidx in self._finger_qpos[side]:
+                    self._finger_qpos[side][qidx] = float(self.data.qpos[qidx])
+            mujoco.mj_forward(self.model, self.data)
+        else:
+            self._safe_robot_qpos = self.data.qpos[self.free_nq:].copy()
+
         sync_mocap_to_sites(self.model, self.data)
         self._maybe_post_frame(now)
 
@@ -882,6 +1053,7 @@ class TeleopTracker:
             "ik_raw_q": ik_raw_q,
             "canonical_q": {s: self.canonical_q[s].copy() for s in ("left", "right")},
             "arm_qpos": {s: self.data.qpos[self.arm_idx[s]].copy() for s in ("left", "right")},
+            "collision_info": self._collision_info.copy(),
         })
 
     # -- Viewer key callback -----------------------------------------------
@@ -1119,6 +1291,10 @@ def main():
         "--socket-port", type=int, default=9004,
         help="Port for the teleop socket server",
     )
+    parser.add_argument(
+        "--no-collision-check", action="store_true", default=False,
+        help="Disable robot self/arm-arm collision rejection",
+    )
     args = parser.parse_args()
 
     tracker = TeleopTracker(
@@ -1126,6 +1302,7 @@ def main():
         reanchor=args.reanchor,
         raw_ik=args.raw_ik,
         stream_frames=not args.no_stream_frames,
+        enable_collision_check=not args.no_collision_check,
         log_npy_path=args.log_npy_path,
         socket_host=args.socket_host,
         socket_port=args.socket_port,

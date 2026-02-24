@@ -29,7 +29,7 @@ python3 "$ROOT/teleop/start_hand_tracker.py" &
 echo $! >> "$PIDFILE"
 
 echo "Starting MuJoCo visualizer (using $PYTHON_CMD)..."
-"$PYTHON_CMD" "$ROOT/run_visualize_tesollo.py" &
+"$PYTHON_CMD" "$ROOT/run_visualize_tesollo.py" "$@" &
 echo $! >> "$PIDFILE"
 
 echo "Starting localtunnel (lt --port 9002 --subdomain teleop)..."

@@ -17,6 +17,10 @@ if not MJCF.exists():
 os.chdir(TESOLLO_DIR)
 os.environ["CHIMERA_MJCF_PATH"] = str(MJCF.resolve())
 
+# Pass-through of extra CLI args to the visualizer so you can toggle
+# features like collision checking when running this helper script.
+EXTRA_ARGS = sys.argv[1:]
+
 def get_mjpython():
     if sys.platform != "darwin":
         return None
@@ -28,11 +32,21 @@ def get_mjpython():
 
 mjpython = get_mjpython()
 if mjpython:
-    os.execv(mjpython, [mjpython, str(VISUALIZER), "--mjcf-path", str(MJCF.resolve()), "--no-stream-frames"])
+    args = [
+        mjpython,
+        str(VISUALIZER),
+        "--mjcf-path",
+        str(MJCF.resolve()),
+        "--no-stream-frames",
+    ]
+    args.extend(EXTRA_ARGS)
+    os.execv(mjpython, args)
 else:
     if sys.platform == "darwin":
         print("On macOS the viewer needs mjpython. Install and run:", file=sys.stderr)
         print("  pip install mujoco", file=sys.stderr)
         print("  venv/bin/mjpython run_visualize_tesollo.py", file=sys.stderr)
         sys.exit(1)
-os.execv(sys.executable, [sys.executable, str(VISUALIZER)])
+args = [sys.executable, str(VISUALIZER)]
+args.extend(EXTRA_ARGS)
+os.execv(sys.executable, args)
