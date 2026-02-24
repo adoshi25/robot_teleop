@@ -39,7 +39,7 @@ FRAME_POST_HZ = 15
 OFFSCREEN_WIDTH = 640
 OFFSCREEN_HEIGHT = 480
 DEFAULT_MJCF = (
-    Path(__file__).parent.parent / "teleop" / "robots" / "dg5f_dual_panda.mjcf.xml"
+    Path(__file__).parent.parent / "teleop" / "robots" / "tesollo_hand" / "robot_scene_combined.xml"
 )
 CONTROL_HZ = 60
 WARMUP_SECONDS = 2.5
@@ -729,6 +729,7 @@ class TeleopTracker:
         self._reanchor = {"left": False, "right": False}
         self._latest_webxr_wrist = {"left": None, "right": None}
         print("Stopped.")
+        self.is_ready = False
         if self._log_samples:
             np.savez_compressed(
                 self.log_npy_path,

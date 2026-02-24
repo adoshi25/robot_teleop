@@ -6,20 +6,37 @@
 # Example: left_wrist__depth means camera named "left_wrist" will provide depth data
 cameras:
   - name: left_wrist
-    serial_number: "18836060"  # Replace with your actual ZED serial number
-    width: 640
-    height: 480
+    serial_number: "18836060"
+    width: 1280
+    height: 720
     use_depth: False
     use_image: True
     primary_lens: "both"
+    baseline: 0.063 # m
+    doffs: 0.0 # mm disparity offset for Foundation Stereo
   - name: right_wrist
-    serial_number: "13458850"  # Replace with your actual ZED serial number
-    width: 640
-    height: 480
+    serial_number: "13458850"
+    width: 1280
+    height: 720
     use_depth: False
     use_image: True
     primary_lens: "both"
+    baseline: 0.063 # m
+    doffs: 0.0 # mm disparity offset for Foundation Stereo
 
+viz_cameras:
+  - name: ego_high
+    use_image: True
+    device_id: "/dev/v4l/by-id/usb-046d_HD_Pro_Webcam_C920_09177ADF-video-index0"
+    width: 1280
+    height: 720
+  - name: front
+    use_image: True
+    device_id: "/dev/v4l/by-id/usb-046d_C922_Pro_Stream_Webcam_9EA9F51F-video-index0"
+    width: 1280
+    height: 720
+
+  
 # Left arm controller configuration
 left_arm_controller:
   server_ip: "tcp://172.16.0.1:4242"
@@ -33,44 +50,58 @@ min_bound: [0.35, -0.24, 0.04]
 max_bound: [0.85, 0.24, 0.5]
 
 # Home joint positions for left arm (7-dim)
-left_home_joints: [0.19, -0.47, 0.32, -2.69, 1.78, 2.08, 0.27]
+left_home_joints:  [0.12851247, -0.74926734,  0.01523919, -2.5314567 ,  1.3384545 , 1.8232623 ,  0.72626555] # actual for rollouts
+left_home_hand_joints: [-0.40, 0.14, 0.08, 0.10, -0.43, 0.07, 0.44, 0.52, 0.77, 0.03, -0.81, 0.31, 0.51, -0.33, -0.12, 0.23, -0.29, -1.03, -0.56, 1.21]
 # Home joint positions for right arm (7-dim)
-right_home_joints: [-0.35, -0.44, -0.12, -2.67, -1.8, 2.18, 1.14]
+right_home_joints: [-0.30540678, -0.79184073,  0.06812683, -2.5840569 , -1.3527942 ,  2.0385659 ,  0.62929636]
+right_home_hand_joints: [0.30, -0.08, -0.07, -0.04, 0.00, -0.04, 0.23, 0.08, 0.28, 0.00, 0.60, 0.25, 0.69, -0.02, 0.71, -0.02, -0.22, -0.82, -0.17, -1.33]
+# Depth threshold for visual observations
+max_depth_threshold: 0.40 # m
 
-# visual observations
-max_depth_threshold: 600
+# Resolution for visual observations
 res_width: 224 # pixels
 res_height: 224 # pixels
-
-
 # Which controllers to enable
-enable_left_arm: False  
-enable_right_arm: True
+enable_left_arm: True
+enable_right_arm: False
 enable_left_hand: True
-enable_right_hand: True
+enable_right_hand: False
 
 # Observation configuration
 # Specify which observations to include in get_observations() output
 observations:
+  # Proprioception  
   left_arm_qpos: True
-  left_arm_qvel: True
+  left_arm_qvel: False
   right_arm_qpos: True
-  right_arm_qvel: True
+  right_arm_qvel: False
   left_hand_qpos: True
   right_hand_qpos: True
-  
+  left_ee_pos: True
+  left_ee_quat: True
+  right_ee_pos: True
+  right_ee_quat: True
   # Visual observations
   # Specify which camera observations to collect
   # Format: {camera_name}__{type} where type is 'image' or 'depth'
   visual:
-    left_wrist__image: True
+    left_wrist_left_image: True
+    # left_wrist_right_image: True
     left_wrist__depth: True
-    right_wrist__image: True
+    right_wrist_left_image: True
+    # right_wrist_right_image: True
     right_wrist__depth: True
-
+    ego_high__image: True
+    front__image: True
 # Frequency control for interpolation
 # Policy frequency: how often new targets are provided (e.g., 15 Hz)
 # Controller frequency: how often PD controller runs (e.g., 60 Hz)
 # If controller_frequency > policy_frequency, targets will be interpolated
-policy_frequency: 2.0  # Hz
+policy_frequency: 30.0  # Hz; 12Hz for waffleiron
 controller_frequency: 60.0  # Hz
+
+# Number of steps to wait for proprioception data to stabilize
+steps_to_wait: 10
+
+# Foundation Stereo configuration
+foundation_stereo: False
