@@ -99,7 +99,7 @@ def main():
             left_hand=action['left_hand'],
             right_hand=action['right_hand'],
         )
-        
+    tracker.stop()
     print("Done!")
     
     # Cleanup

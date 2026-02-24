@@ -913,6 +913,9 @@ class TeleopTracker:
 
             if cmd == "is_ready":
                 resp = json.dumps({"ready": self.is_ready})
+            elif cmd == "stop":
+                self.stop()
+                resp = json.dumps({"ok": True})
             elif cmd == "get_qpos":
                 order = arg if arg in ("mujoco", "genesis") else "genesis"
                 # if not self.is_ready:

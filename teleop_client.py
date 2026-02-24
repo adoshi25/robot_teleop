@@ -38,6 +38,13 @@ class TeleopClient:
         resp = self._request("is_ready")
         return bool(resp.get("ready", False))
 
+    def stop(self):
+        """Stop the TeleopTracker session (ends tracking, optionally saves logs)."""
+        resp = self._request("stop")
+        if "error" in resp:
+            raise RuntimeError(resp["error"])
+        return resp.get("ok", False)
+
     def get_qpos(self, order="genesis"):
         """Return the current robot joint positions as a numpy array.
 
