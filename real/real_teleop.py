@@ -92,7 +92,6 @@ def main():
             'right_arm': action[27:34],
             'right_hand': action[34:54],
         }
-        break
         env.step(
             left_arm=action['left_arm'],
             right_arm=action['right_arm'],

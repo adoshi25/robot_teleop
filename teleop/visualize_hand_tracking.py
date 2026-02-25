@@ -42,8 +42,8 @@ DEFAULT_MJCF = (
     Path(__file__).parent.parent / "teleop" / "robots" / "tesollo_hand" / "robot_scene_combined.xml"
 )
 CONTROL_HZ = 60
-WARMUP_SECONDS = 2.5
-MAX_JOINT_DELTA = 1000
+WARMUP_SECONDS = 10
+MAX_JOINT_DELTA = 1
 
 JOINT_NAMES = [
     "wrist",
