@@ -38,6 +38,9 @@ def _get_robot_base_poses_from_model(model):
     }
 
 
+# Max IK iterations for real-time: warm start converges quickly; cold needs more.
+_IK_MAX_ITERATIONS = 12
+
 def _solve_ik_core_jax(
     robot,
     target_link_index: jnp.ndarray,
@@ -63,6 +66,7 @@ def _solve_ik_core_jax(
             verbose=False,
             linear_solver="dense_cholesky",
             trust_region=jaxls.TrustRegionConfig(lambda_initial=1.0),
+            termination=jaxls.TerminationConfig(max_iterations=_IK_MAX_ITERATIONS),
         )
     )
     return sol[joint_var]
@@ -94,6 +98,7 @@ def _solve_ik_core_jax_warm(
             verbose=False,
             linear_solver="dense_cholesky",
             trust_region=jaxls.TrustRegionConfig(lambda_initial=1.0),
+            termination=jaxls.TerminationConfig(max_iterations=_IK_MAX_ITERATIONS),
             initial_vals=jaxls.VarValues.make((joint_var.with_value(initial_q),)),
         )
     )
@@ -125,6 +130,7 @@ def _solve_ik_core_balanced(
             verbose=False,
             linear_solver="dense_cholesky",
             trust_region=jaxls.TrustRegionConfig(lambda_initial=1.0),
+            termination=jaxls.TerminationConfig(max_iterations=_IK_MAX_ITERATIONS),
         )
     )
     return sol[joint_var]
@@ -156,6 +162,7 @@ def _solve_ik_core_balanced_warm(
             verbose=False,
             linear_solver="dense_cholesky",
             trust_region=jaxls.TrustRegionConfig(lambda_initial=1.0),
+            termination=jaxls.TerminationConfig(max_iterations=_IK_MAX_ITERATIONS),
             initial_vals=jaxls.VarValues.make((joint_var.with_value(initial_q),)),
         )
     )

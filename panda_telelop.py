@@ -90,10 +90,15 @@ class PandaArmTrajectoryProcessor:
 
     def _get_panda_joint_indices(self, side):
         if side == "left":
-            joint_names = (
-                [f"panda_left_joint{i}" for i in range(1, 7)]
-                + ["panda_joint7"]
+            # Left 7th joint: panda_left_joint7 (dg5f) or panda_joint7 (tesollo)
+            joint_names = [f"panda_left_joint{i}" for i in range(1, 7)]
+            jid7 = mujoco.mj_name2id(
+                self._mj_model, mujoco.mjtObj.mjOBJ_JOINT, "panda_left_joint7",
             )
+            if jid7 >= 0:
+                joint_names.append("panda_left_joint7")
+            else:
+                joint_names.append("panda_joint7")
         else:
             joint_names = [f"panda_right_joint{i}" for i in range(1, 8)]
         indices = []
@@ -101,6 +106,8 @@ class PandaArmTrajectoryProcessor:
             jid = mujoco.mj_name2id(
                 self._mj_model, mujoco.mjtObj.mjOBJ_JOINT, name,
             )
+            if jid < 0:
+                raise ValueError(f"Joint {name!r} not found in model {self.scene_path}")
             qposadr = self._mj_model.jnt_qposadr[jid]
             nq = (
                 1
