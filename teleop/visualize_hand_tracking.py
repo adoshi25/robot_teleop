@@ -20,6 +20,8 @@ import threading
 import time
 from pathlib import Path
 
+import yaml
+
 import mujoco
 import mujoco.viewer
 import numpy as np
@@ -30,116 +32,40 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from panda_telelop import PandaArmTrajectoryProcessor
 
 # ---------------------------------------------------------------------------
-# Config
+# Config (loaded from teleop/config.yaml)
 # ---------------------------------------------------------------------------
 
-HAND_TRACKER_URL = "http://localhost:9002/get_hand_data"
-FRAME_POST_URL = "http://localhost:9002/mujoco_frame"
-FRAME_POST_HZ = 15
-OFFSCREEN_WIDTH = 640
-OFFSCREEN_HEIGHT = 480
-DEFAULT_MJCF = (
-    Path(__file__).parent.parent / "teleop" / "robots" / "tesollo_hand" / "robot_scene_combined.xml"
+_CONFIG_PATH = Path(__file__).parent / "config.yaml"
+with open(_CONFIG_PATH) as f:
+    _CFG = yaml.safe_load(f)
+
+_HT = _CFG["hand_tracking"]
+_ARM_LIMITS = _CFG.get("limits", {}).get("arm", {})
+_REPO_ROOT = Path(__file__).parent.parent
+
+HAND_TRACKER_URL = _HT["hand_tracker_url"]
+FRAME_POST_URL = _HT["frame_post_url"]
+FRAME_POST_HZ = _HT["frame_post_hz"]
+OFFSCREEN_WIDTH = _HT["offscreen_width"]
+OFFSCREEN_HEIGHT = _HT["offscreen_height"]
+DEFAULT_MJCF = _REPO_ROOT / _HT["default_mjcf"]
+CONTROL_HZ = _HT["control_hz"]
+WARMUP_SECONDS = _HT["warmup_seconds"]
+MAX_JOINT_DELTA = _HT["max_joint_delta"]
+WRIST_POSE_SENSITIVITY = _HT["wrist_pose_sensitivity"]
+THUMB_OPP_GAIN = _HT["thumb_opp_gain"]
+
+JOINT_NAMES = _HT["joint_names"]
+MOCAP_BODIES = {side: {j: f"{side}-{j}" for j in JOINT_NAMES} for side in ("left", "right")}
+ROBOT_SITES = _HT["robot_sites"]
+FINGER_KEYPOINTS = _HT["finger_keypoints"]
+FINGER_JOINT_NAMES = _HT["finger_joint_names"]
+FINGER_ANGLE_TO_JOINT = _HT["finger_angle_to_joint"]
+# Convert to list of tuples for compatibility
+_ABD_FINGERS = [tuple(row) for row in _HT["abd_fingers"]]
+ARM_JOINT_VEL_LIMITS = np.array(
+    _ARM_LIMITS.get("joint_vel", [2.075, 2.075, 2.075, 2.075, 2.8, 2.8, 2.8]),
 )
-CONTROL_HZ = 60
-WARMUP_SECONDS = 10
-MAX_JOINT_DELTA = 1
-
-JOINT_NAMES = [
-    "wrist",
-    "thumb-tip",
-    "index-finger-tip",
-    "middle-finger-tip",
-    "ring-finger-tip",
-    "pinky-finger-tip",
-]
-
-MOCAP_BODIES = {
-    side: {j: f"{side}-{j}" for j in JOINT_NAMES} for side in ("left", "right")
-}
-
-ROBOT_SITES = {
-    "left": {
-        "wrist": "left_palm_site",
-        "thumb-tip": "left_thumb_tip_site",
-        "index-finger-tip": "left_index_tip_site",
-        "middle-finger-tip": "left_middle_tip_site",
-        "ring-finger-tip": "left_ring_tip_site",
-        "pinky-finger-tip": "left_pinky_tip_site",
-    },
-    "right": {
-        "wrist": "right_palm_site",
-        "thumb-tip": "right_thumb_tip_site",
-        "index-finger-tip": "right_index_tip_site",
-        "middle-finger-tip": "right_middle_tip_site",
-        "ring-finger-tip": "right_ring_tip_site",
-        "pinky-finger-tip": "right_pinky_tip_site",
-    },
-}
-
-FINGER_KEYPOINTS = {
-    "thumb": [
-        "thumb-metacarpal", "thumb-phalanx-proximal",
-        "thumb-phalanx-distal", "thumb-tip",
-    ],
-    "index": [
-        "index-finger-metacarpal", "index-finger-phalanx-proximal",
-        "index-finger-phalanx-intermediate", "index-finger-phalanx-distal",
-        "index-finger-tip",
-    ],
-    "middle": [
-        "middle-finger-metacarpal", "middle-finger-phalanx-proximal",
-        "middle-finger-phalanx-intermediate", "middle-finger-phalanx-distal",
-        "middle-finger-tip",
-    ],
-    "ring": [
-        "ring-finger-metacarpal", "ring-finger-phalanx-proximal",
-        "ring-finger-phalanx-intermediate", "ring-finger-phalanx-distal",
-        "ring-finger-tip",
-    ],
-    "pinky": [
-        "pinky-finger-metacarpal", "pinky-finger-phalanx-proximal",
-        "pinky-finger-phalanx-intermediate", "pinky-finger-phalanx-distal",
-        "pinky-finger-tip",
-    ],
-}
-
-FINGER_JOINT_NAMES = {
-    "left": {
-        "thumb":  ["lj_dg_1_1", "lj_dg_1_2", "lj_dg_1_3", "lj_dg_1_4"],
-        "index":  ["lj_dg_2_1", "lj_dg_2_2", "lj_dg_2_3", "lj_dg_2_4"],
-        "middle": ["lj_dg_3_1", "lj_dg_3_2", "lj_dg_3_3", "lj_dg_3_4"],
-        "ring":   ["lj_dg_4_1", "lj_dg_4_2", "lj_dg_4_3", "lj_dg_4_4"],
-        "pinky":  ["lj_dg_5_1", "lj_dg_5_2", "lj_dg_5_3", "lj_dg_5_4"],
-    },
-    "right": {
-        "thumb":  ["rj_dg_1_1", "rj_dg_1_2", "rj_dg_1_3", "rj_dg_1_4"],
-        "index":  ["rj_dg_2_1", "rj_dg_2_2", "rj_dg_2_3", "rj_dg_2_4"],
-        "middle": ["rj_dg_3_1", "rj_dg_3_2", "rj_dg_3_3", "rj_dg_3_4"],
-        "ring":   ["rj_dg_4_1", "rj_dg_4_2", "rj_dg_4_3", "rj_dg_4_4"],
-        "pinky":  ["rj_dg_5_1", "rj_dg_5_2", "rj_dg_5_3", "rj_dg_5_4"],
-    },
-}
-
-# Maps inter-bone-angle index → robot joint index (0-based within the 4 joints).
-# Thumb: 4 keypoints → 3 bones → 2 angles → joints _3,_4 (flexion only)
-# Index/middle/ring: 5 kp → 4 bones → 3 angles → joints _2,_3,_4
-# Pinky: 5 kp → 4 bones → 3 angles → skip MCP, joints _3,_4
-FINGER_ANGLE_TO_JOINT = {
-    "thumb":  {0: 2, 1: 3},
-    "index":  {0: 1, 1: 2, 2: 3},
-    "middle": {0: 1, 1: 2, 2: 3},
-    "ring":   {0: 1, 1: 2, 2: 3},
-    "pinky":  {1: 2, 2: 3},
-}
-
-# Abduction: proximal → intermediate bone direction, projected onto palm plane.
-_ABD_FINGERS = [
-    ("index",  "index-finger-phalanx-proximal",  "index-finger-phalanx-intermediate",  0),
-    ("middle", "middle-finger-phalanx-proximal",  "middle-finger-phalanx-intermediate", 0),
-    ("ring",   "ring-finger-phalanx-proximal",    "ring-finger-phalanx-intermediate",   0),
-    ("pinky",  "pinky-finger-phalanx-proximal",   "pinky-finger-phalanx-intermediate",  1),
-]
 
 # ---------------------------------------------------------------------------
 # Coordinate / quaternion helpers
@@ -355,7 +281,34 @@ def calibrate_abduction_rest(hand_data):
             rest[(side, fname)] = float(np.arctan2(
                 np.dot(bone, lat), np.dot(bone, fwd)
             ))
+
+        _calibrate_thumb_rest(joints, fwd, lat, nrm, side, rest)
     return rest
+
+
+def _calibrate_thumb_rest(joints, fwd, lat, nrm, side, rest):
+    """Record thumb rest angles for abduction (out-of-plane) and opposition (in-plane)."""
+    meta = _get_pos(joints, "thumb-metacarpal")
+    prox = _get_pos(joints, "thumb-phalanx-proximal")
+    if meta is None or prox is None:
+        return
+    bone = prox - meta
+    bl = np.linalg.norm(bone)
+    if bl < 1e-6:
+        return
+    bone_n = bone / bl
+
+    rest[(side, "thumb_elev")] = float(
+        np.arcsin(np.clip(np.dot(bone_n, nrm), -1.0, 1.0))
+    )
+
+    bone_proj = bone - np.dot(bone, nrm) * nrm
+    pn = np.linalg.norm(bone_proj)
+    if pn > 1e-6:
+        bone_proj_n = bone_proj / pn
+        rest[(side, "thumb_ip")] = float(
+            np.arctan2(np.dot(bone_proj_n, lat), np.dot(bone_proj_n, fwd))
+        )
 
 
 def _compute_abduction(hand_joints, side, finger_map, result, abd_rest):
@@ -387,6 +340,56 @@ def _compute_abduction(hand_joints, side, finger_map, result, abd_rest):
             continue
         qpos_idx, lo, hi = finger_map[key]
         result[qpos_idx] = float(np.clip(abd, lo, hi))
+
+    _compute_thumb_lateral(hand_joints, side, finger_map, result, abd_rest, fwd, lat, nrm)
+
+
+def _compute_thumb_lateral(hand_joints, side, finger_map, result, abd_rest,
+                           fwd, lat, nrm):
+    """Drive thumb abduction (j0) and opposition (j1) from WebXR bone angles.
+
+    j0 (X-axis tilt)    ← in-palm-plane lateral angle  (smaller signal).
+    j1 (Z-axis lateral) ← out-of-palm-plane elevation  (larger signal, amplified
+        by thumb_opp_gain to compensate for the kinematic mismatch between
+        human and Tesollo thumb geometry).
+    """
+    meta = _get_pos(hand_joints, "thumb-metacarpal")
+    prox = _get_pos(hand_joints, "thumb-phalanx-proximal")
+    if meta is None or prox is None:
+        return
+    bone = prox - meta
+    bl = np.linalg.norm(bone)
+    if bl < 1e-6:
+        return
+    bone_n = bone / bl
+    side_sign = -1.0 if side == "left" else 1.0
+
+    elev = float(np.arcsin(np.clip(np.dot(bone_n, nrm), -1.0, 1.0)))
+    rest_elev = abd_rest.get((side, "thumb_elev"), elev)
+
+    bone_proj = bone - np.dot(bone, nrm) * nrm
+    pn = np.linalg.norm(bone_proj)
+    if pn < 1e-6:
+        return
+    bone_proj_n = bone_proj / pn
+    ip_angle = float(np.arctan2(np.dot(bone_proj_n, lat), np.dot(bone_proj_n, fwd)))
+    rest_ip = abd_rest.get((side, "thumb_ip"), ip_angle)
+
+    # j0 — tilt from in-plane angle
+    abd = side_sign * (ip_angle - rest_ip)
+    key0 = (side, "thumb", 0)
+    if key0 in finger_map:
+        qpos_idx, lo, hi = finger_map[key0]
+        result[qpos_idx] = float(np.clip(abd, lo, hi))
+
+    # j1 — lateral swing from out-of-plane elevation (amplified).
+    # No side_sign: the elevation naturally inverts between hands, and the
+    # joint limits already mirror ([0,π] left vs [-π,0] right).
+    opp = THUMB_OPP_GAIN * (rest_elev - elev)
+    key1 = (side, "thumb", 1)
+    if key1 in finger_map:
+        qpos_idx, lo, hi = finger_map[key1]
+        result[qpos_idx] = float(np.clip(opp, lo, hi))
 
 
 def retarget_fingers(hand_joints, side, finger_map, abd_rest):
@@ -520,6 +523,7 @@ class TeleopTracker:
         log_npy_path="hand_teleop_log.npz",
         socket_host="127.0.0.1",
         socket_port=9004,
+        wrist_pose_sensitivity=None,
     ):
         self.mjcf_path = Path(mjcf_path) if mjcf_path else DEFAULT_MJCF
         self.reanchor_enabled = reanchor
@@ -528,6 +532,11 @@ class TeleopTracker:
         self.log_npy_path = log_npy_path
         self.socket_host = socket_host
         self.socket_port = socket_port
+        self.wrist_pose_sensitivity = (
+            wrist_pose_sensitivity
+            if wrist_pose_sensitivity is not None
+            else WRIST_POSE_SENSITIVITY
+        )
         self.dt = 1.0 / CONTROL_HZ
 
         if not self.mjcf_path.exists():
@@ -770,6 +779,25 @@ class TeleopTracker:
             "rejected": rejected,
         }
 
+    def _apply_wrist_sensitivity(self, wrist_pose, side):
+        """Scale wrist position delta from canonical by wrist_pose_sensitivity.
+
+        target_pos = canonical + sensitivity * (current - canonical)
+        sensitivity=1 is 1:1; >1 amplifies hand motion (robot moves more).
+        """
+        sens = self.wrist_pose_sensitivity
+        if sens == 1.0:
+            return wrist_pose
+        pos = np.array(wrist_pose[:3], dtype=float)
+        canon = self.canonical.get(side, {}).get("wrist")
+        if canon is None:
+            return wrist_pose
+        canon = np.asarray(canon, dtype=float)
+        scaled_pos = canon + sens * (pos - canon)
+        if len(wrist_pose) >= 7:
+            return np.concatenate([scaled_pos, wrist_pose[3:7]])
+        return scaled_pos
+
     # -- IK callback -------------------------------------------------------
 
     def _on_ik(self, side, q, _t):
@@ -961,6 +989,9 @@ class TeleopTracker:
 
                     wrist_pose = get_offset_wrist_pose(hand_data, side, self.offsets)
                     if wrist_pose is not None:
+                        wrist_pose = self._apply_wrist_sensitivity(
+                            wrist_pose, side
+                        )
                         self.proc.add_point(wrist_pose, side)
                     if joints:
                         self._finger_qpos[side] = retarget_fingers(
@@ -969,10 +1000,17 @@ class TeleopTracker:
             self._last_fetch = now
 
         # Apply IK + finger results to qpos
+        # Enforce arm joint velocity limits at MuJoCo level — reject if any joint
+        # would exceed limits (don't apply, keep previous pose)
         for side in ("left", "right"):
             q = self._ik_q[side]
-            if q is not None:
-                self.data.qpos[self.arm_idx[side]] = q
+            # if q is not None:
+            #     prev = self.data.qpos[self.arm_idx[side]].copy()
+            #     max_delta = ARM_JOINT_VEL_LIMITS * self.dt
+            #     delta = np.abs(q - prev)
+            #     if np.any(delta > max_delta):
+            #         continue  # Reject: don't apply this arm's q
+            self.data.qpos[self.arm_idx[side]] = q
             for qidx, angle in self._finger_qpos[side].items():
                 self.data.qpos[qidx] = angle
 
@@ -1295,6 +1333,10 @@ def main():
         "--no-collision-check", action="store_true", default=False,
         help="Disable robot self/arm-arm collision rejection",
     )
+    parser.add_argument(
+        "--wrist-pose-sensitivity", type=float, default=WRIST_POSE_SENSITIVITY,
+        help="Scale factor for wrist position changes (1=1:1; >1 = more sensitive)",
+    )
     args = parser.parse_args()
 
     tracker = TeleopTracker(
@@ -1306,6 +1348,7 @@ def main():
         log_npy_path=args.log_npy_path,
         socket_host=args.socket_host,
         socket_port=args.socket_port,
+        wrist_pose_sensitivity=args.wrist_pose_sensitivity,
     )
     tracker.run(blocking=True)
     tracker.shutdown()
