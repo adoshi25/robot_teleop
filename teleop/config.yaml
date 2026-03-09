@@ -7,7 +7,7 @@ hand_tracking:
   default_mjcf: "teleop/robots/tesollo_hand/robot_scene_combined.xml"
   control_hz: 60
   warmup_seconds: 10
-  max_joint_delta: 1
+  max_joint_delta: 1000
   wrist_pose_sensitivity: 2  # Scale for wrist position; >1 = more sensitive
   thumb_opp_gain: 2  # Scale for thumb opposition; compensates for kinematic mismatch
 

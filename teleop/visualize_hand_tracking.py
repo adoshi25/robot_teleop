@@ -1027,8 +1027,8 @@ class TeleopTracker:
             self.data.qpos[self.free_nq:] = self._safe_robot_qpos
             for side in ("left", "right"):
                 self._prev_ik_q[side] = self.data.qpos[self.arm_idx[side]].copy()
-                for qidx in self._finger_qpos[side]:
-                    self._finger_qpos[side][qidx] = float(self.data.qpos[qidx])
+                for qidx, angle in self._finger_qpos[side].items():
+                    self.data.qpos[qidx] = angle
             mujoco.mj_forward(self.model, self.data)
         else:
             self._safe_robot_qpos = self.data.qpos[self.free_nq:].copy()
