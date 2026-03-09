@@ -17,7 +17,10 @@ Trajectory format: (num_steps, 54) numpy array where:
 import argparse
 import sys
 import os
+from queue import Queue, Empty
+
 import pyrallis
+from pynput import keyboard
 # Add tesollo-control to path
 sys.path.insert(0, "/scr/satvik/tesollo-control")
 
@@ -32,6 +35,27 @@ from common_utils import FreqGuard
 from teleop_client import TeleopClient
 import time
 from teleop_config import TeleopConfig
+
+# Global queue for keyboard events
+keyboard_queue = Queue()
+
+
+def setup_keyboard_listener():
+    """Set up pynput keyboard listener to capture 'a', 'b', and 'c' key presses."""
+    def on_press(key):
+        try:
+            if key.char == 'a':
+                keyboard_queue.put_nowait('a')
+            elif key.char == 'b':
+                keyboard_queue.put_nowait('b')
+            elif key.char == 'c':
+                keyboard_queue.put_nowait('c')
+        except AttributeError:
+            pass  # Special key, ignore
+
+    listener = keyboard.Listener(on_press=on_press)
+    listener.start()
+    return listener
 
 
 def main():
@@ -82,22 +106,37 @@ def main():
         time.sleep(1)
         print("Waiting for teleop tracker to be ready...")
         continue
-    # Execute trajectory
-    for i in range(teleop_cfg.max_horizon):
-        action = tracker.get_qpos(order="genesis")
-        print(action)
-        action = {
-            'left_arm': action[:7],
-            'left_hand': action[7:27],
-            'right_arm': action[27:34],
-            'right_hand': action[34:54],
-        }
-        env.step(
-            left_arm=action['left_arm'],
-            right_arm=action['right_arm'],
-            left_hand=action['left_hand'],
-            right_hand=action['right_hand'],
-        )
+
+    # Start keyboard listener for interrupt keys (a, b, c)
+    listener = setup_keyboard_listener()
+    try:
+        # Execute trajectory
+        for i in range(teleop_cfg.max_horizon):
+            # Check for interrupt key (a, b, or c)
+            try:
+                key = keyboard_queue.get_nowait()
+                print(f"\nInterrupt key '{key}' pressed, stopping execution.")
+                break
+            except Empty:
+                pass
+
+            action = tracker.get_qpos(order="genesis")
+            print(action)
+            action = {
+                'left_arm': action[:7],
+                'left_hand': action[7:27],
+                'right_arm': action[27:34],
+                'right_hand': action[34:54],
+            }
+            env.step(
+                left_arm=action['left_arm'],
+                right_arm=action['right_arm'],
+                left_hand=action['left_hand'],
+                right_hand=action['right_hand'],
+            )
+    finally:
+        listener.stop()
+
     tracker.stop()
     print("Done!")
     
@@ -115,4 +154,3 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     main()
-

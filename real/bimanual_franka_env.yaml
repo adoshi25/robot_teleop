@@ -63,9 +63,9 @@ res_width: 224 # pixels
 res_height: 224 # pixels
 # Which controllers to enable
 enable_left_arm: True
-enable_right_arm: False
+enable_right_arm: True
 enable_left_hand: True
-enable_right_hand: False
+enable_right_hand: True
 
 # Observation configuration
 # Specify which observations to include in get_observations() output
